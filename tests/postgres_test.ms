@@ -409,3 +409,40 @@ test "stream sends rows as the server produces them":
 test "a stream ends with the server error":
 	failure := expect_error(collect(stream(config()?, "select 1/0", []), max_items: 10))?
 	expect_equal(failure.kind, "22012")?
+
+fn add_total(var total: Int, row: List[Value]) Void!:
+	total += row[0].int().get(0)
+	return ok()
+
+fn refuse(row: List[Value]) Void!:
+	return error(Error("stop", kind: "ESTOP"))
+
+test "a pool streams rows from a pooled connection":
+	var pool = start(config()?, 2)?
+	var total = 0
+	header := pool.each(
+		"select n from generate_series(1, 20000) n",
+		[],
+		fn row: add_total(var total, row)
+	)?
+	expect_equal(total, 200010000)?
+	expect_equal(header.columns, ["n"])?
+	expect_equal(header.command, "SELECT 20000")?
+
+	// A failing callback does not leave the worker out of step.
+	failure := expect_error(
+		pool.each(
+			"select n from generate_series(1, 500) n",
+			[],
+			fn row: refuse(row)
+		)
+	)?
+	expect_equal(failure.kind, "ESTOP")?
+
+	after := pool.query("select 7::int")?
+	expect_equal(after.rows[0][0], Value.Int(7))?
+
+	// The same connection serves a server error.
+	broken := expect_error(pool.each("select 1/0", [], fn row: refuse(row)))?
+	expect_equal(broken.kind, "22012")?
+	pool.close()?
