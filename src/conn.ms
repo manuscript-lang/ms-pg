@@ -93,7 +93,7 @@ fn server_error(fields: Map[String, String]) Error:
 	)
 
 fn protocol(what: String) Error:
-	return Error("postgres: {what}", kind: "EPROTO")
+	return Error(f"postgres: {what}", kind: "EPROTO")
 
 // Makes at least `count` unread bytes available, joining chunks once so a large message
 // costs linear time.
@@ -181,7 +181,7 @@ fn negotiate_tls(var net: Connection, tls: TlsOptions, host: String, timeout: Du
 
 // Connects, authenticates, and returns a connection ready for queries.
 export fn open(config: Config) Conn!:
-	address := "{config.host}:{config.port}"
+	address := f"{config.host}:{config.port}"
 	var net = connect(address, none, config.timeout.clone()).wait()?
 	if options := config.tls:
 		net = negotiate_tls(var net, options, config.host, config.timeout.clone())?

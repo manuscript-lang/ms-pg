@@ -123,5 +123,5 @@ fn main() Void!:
 	)
 	var total = 0
 	for task in tasks: total += task.wait()?
-	print("checksum {total}")
+	print(f"checksum {total}")
 	return ok()
