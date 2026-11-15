@@ -1,12 +1,12 @@
 import (
 	environment from "@std/os/env.ms",
 
-	Config, open from "@postgres/conn.ms",
-	Value from "@postgres/value.ms",
+	Config, open from "@pg/conn.ms",
+	Value from "@pg/value.ms",
 )
 
 // Runs one query through the package, fetched as a git dependency.
-fn main() Unit!:
+fn main() Void!:
 	env := environment()?
 	port := env.get_or("PGPORT", "5432").parse_int().ok_or(Error("bad PGPORT"))?
 	var conn = open(Config(port: port, password: env.get_or("PGPASSWORD", "")))?

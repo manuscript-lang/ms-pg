@@ -6,6 +6,7 @@ import (
 	environment from "@std/os/env.ms",
 	read_file from "@std/os/fs.ms",
 	expect_equal, expect_error, expect_true from "@std/test/test.ms",
+	Timestamp from "@std/time.ms",
 
 	md5_password from "@pg/auth.ms",
 	Config, Conn, open from "@pg/conn.ms",
@@ -165,13 +166,13 @@ test "a cleartext password is refused without TLS":
 	failure := expect_error(login("clearuser", "clearpass", true))?
 	expect_equal(failure.kind, "EACCES")?
 
-fn impostor_accept(accepted: Promise[Connection]) Unit!:
+fn impostor_accept(accepted: Promise[Connection]) Void!:
 	var client = accepted.wait()?
 	return impostor(var client)
 
 // A server that offers SCRAM and then says "authenticated" without ever proving it
 // knows the password.
-fn impostor(var client: Connection) Unit!:
+fn impostor(var client: Connection) Void!:
 	_ := client.input.next()?
 
 	// R, length 23, method 10, "SCRAM-SHA-256", two NULs
@@ -235,13 +236,13 @@ test "TLS login upgrades the socket after an SSLRequest":
 	conn.close()?
 
 // A server that answers the SSL request with `N`: no TLS here.
-fn refuser(var client: Connection) Unit!:
+fn refuser(var client: Connection) Void!:
 	_ := client.input.next()?
 	client.output.write(Bytes([78]))?
 	client.close()?
 	return ok(unit)
 
-fn refuser_accept(accepted: Promise[Connection]) Unit!:
+fn refuser_accept(accepted: Promise[Connection]) Void!:
 	var client = accepted.wait()?
 	return refuser(var client)
 
@@ -256,3 +257,64 @@ test "a server that refuses TLS is an error and not a plaintext fallback":
 	expect_equal(failure.kind, "ENOTSUP")?
 	accepting.wait()?
 	listener.close()?
+
+fn first_row(var conn: Conn, sql: String) List[Value]!:
+	statement := conn.prepare("", sql)?
+	rows := conn.run(statement, [])?
+	return ok(rows.rows[0].clone())
+
+test "binary results decode the common types":
+	var conn = open(config()?)?
+	row := first_row(
+		var conn,
+		"select 1::int2, -2::int4, 9007199254740993::int8, 1.5::float4, -2.25::float8, true, '\\x00ff'::bytea, 'héllo'::text, 'v'::varchar, '123e4567-e89b-12d3-a456-426614174000'::uuid, 12::oid, null::int8",
+	)?
+	expect_equal(row[0], Value.Int(1))?
+	expect_equal(row[1], Value.Int(-2))?
+	expect_equal(row[2], Value.Int(9007199254740993))?
+	expect_equal(row[3], Value.Float(1.5))?
+	expect_equal(row[4], Value.Float(-2.25))?
+	expect_equal(row[5], Value.Bool(true))?
+	expect_equal(row[6], Value.Bytes(Bytes([0, 255])))?
+	expect_equal(row[7], Value.Text("héllo"))?
+	expect_equal(row[8], Value.Text("v"))?
+	expect_equal(row[9], Value.Text("123e4567-e89b-12d3-a456-426614174000"))?
+	expect_equal(row[10], Value.Int(12))?
+	expect_equal(row[11], Value.Null)?
+	conn.close()?
+
+test "binary results decode timestamps and dates":
+	var conn = open(config()?)?
+	row := first_row(
+		var conn,
+		"select '2026-11-15 12:34:56.789012+00'::timestamptz, '1969-12-31 23:59:59.5'::timestamp, '2000-01-01'::date, '1970-01-02'::date, 'infinity'::timestamptz",
+	)?
+	expect_equal(
+		row[0],
+		Value.Timestamp(Timestamp(seconds: 1794746096, nanos: 789012000)),
+	)?
+	expect_equal(row[1], Value.Timestamp(Timestamp(seconds: -1, nanos: 500000000)))?
+	expect_equal(row[2], Value.Date(10957))?
+	expect_equal(row[3], Value.Date(1))?
+	expect_equal(row[4], Value.Text("infinity"))?
+	conn.close()?
+
+test "binary and text results agree, and numeric stays text":
+	var binary = open(config()?)?
+	cfg := config()?
+	var text = open(
+		Config(
+			host: cfg.host.clone(),
+			port: cfg.port,
+			user: cfg.user.clone(),
+			password: cfg.password.clone(),
+			binary_results: false,
+		)
+	)?
+	sql := "select 7::int4, 0.1::float8, 'x'::text, 1.25::numeric, 'e'::bytea"
+	expect_equal(first_row(var binary, sql)?, first_row(var text, sql)?)?
+
+	row := first_row(var binary, sql)?
+	expect_equal(row[3], Value.Text("1.25"))?
+	binary.close()?
+	text.close()?

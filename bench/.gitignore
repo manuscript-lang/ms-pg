@@ -2,3 +2,4 @@
 ms/pg/
 ms/ms.lock
 rust/target/
+ms/.ms-cache/

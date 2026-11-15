@@ -3,8 +3,19 @@
 A PostgreSQL client written in Manuscript over the standard library's TCP and TLS. No C and no Rust crates.
 
 Supported: protocol v3 startup, SCRAM-SHA-256 login (the server must prove it knows the password), the simple and
-extended query protocols (parse, bind and execute in one round trip), prepared statements, typed parameters and results
-in text format, transactions, server errors that carry their SQLSTATE in `Error.kind`, and a pool of worker tasks.
+extended query protocols (parse, bind and execute in one round trip), prepared statements, typed parameters, results in text or binary format, transactions, server errors that carry their SQLSTATE in `Error.kind`, and a pool of worker tasks.
+
+## Binary results
+
+Prepared statements (`Conn.prepare` then `Conn.run`) ask for each result column in binary format when the client has a
+decoder for its type: `int2`, `int4`, `int8`, `oid`, `float4`, `float8`, `bool`, `bytea`, `text`, `varchar`, `uuid`,
+`date`, `timestamp` and `timestamptz`. Every other type, such as `numeric`, stays text, chosen per column in the Bind
+message. Parameters are still sent as text, and `Conn.query` (one round trip, columns unknown until it returns) stays
+text. Set `Config.binary_results` to false for text everywhere.
+
+A binary `timestamp` or `timestamptz` arrives as `Value.Timestamp` (UTC) and a `date` as `Value.Date` (days since
+1970-01-01); in text format both are `Value.Text`, because their meaning depends on the session time zone. A `uuid` is
+`Value.Text` in both formats, and `infinity` values are `Value.Text("infinity")` and `Value.Text("-infinity")`.
 
 ## Logins
 
@@ -24,7 +35,7 @@ version that supports TLS.
 import Config, open from "@pg/conn.ms"
 import Value from "@pg/value.ms"
 
-fn main() Unit!:
+fn main() Void!:
     var conn = open(Config(password: "secret"))?
     rows := conn.query("select $1::int8 + 1", [Value.Int(41)])?
     print("{rows.rows[0][0]}")
@@ -43,22 +54,15 @@ and on dispatch on Linux, macOS and Windows, with a `ms` built from the `manuscr
 
 ## As a dependency
 
-This repository is a Manuscript package: its root holds `ms.toml` and `src/`. Add it to a project with `ms add`, which
-installs it, pins it in `ms.lock`, and with `--allow` accepts the effects it declares (`std.net.*`, `std.clock.read`,
-`std.random.read`):
-
-```sh
-ms add https://github.com/manuscript-lang/ms-pg.git --sha <40-character commit> --allow
-```
-
-This writes the following to `ms.toml`; import with `import Config, open from "@pg/conn.ms"`.
+This repository is a Manuscript package: its root holds `ms.toml` and `src/`. Name it under `[dependencies]` with a tag
+or a full commit, allow the effects it declares under `[effects]`, and run `ms fetch`, which pins it in `ms.lock`:
 
 ```toml
 [dependencies]
-"@pg" = { url = "https://github.com/manuscript-lang/ms-pg.git", sha = "<40-character commit>" }
+"@pg" = "https://github.com/manuscript-lang/ms-pg.git#<tag or 40-character commit>"
 
 [effects]
-"@pg" = ["std.net.*", "std.clock.read", "std.random.read"]
+"@pg" = "std.net.* std.clock.read std.random.read"
 ```
 
-`tests/consumer/run.sh` does this against a local git repository and runs a query.
+Import with `import Config, open from "@pg/conn.ms"`. `tests/consumer/run.sh` does this against a local git repository and runs a query.

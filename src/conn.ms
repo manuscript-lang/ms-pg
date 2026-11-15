@@ -6,7 +6,7 @@ import (
 	Duration from "@std/time.ms",
 
 	md5_password, scram_start from "@pg/auth.ms",
-	Value, decode_value, encode_value from "@pg/value.ms",
+	Value, decode_value, encode_value, is_binary_type from "@pg/value.ms",
 	Backend,
 	Field,
 	PORTAL,
@@ -43,6 +43,10 @@ export type Config:
 	// is always accepted.
 	allow_md5: Bool = false
 	timeout: Duration? = none
+	// Fetch the columns of prepared statements in binary format where a decoder exists
+	// (integers, floats, bool, bytea, text, uuid, date, timestamp). Other columns, such
+	// as numeric, stay text. Off gives text for everything.
+	binary_results: Bool = true
 
 // The result of one statement.
 export type Rows:
@@ -68,6 +72,7 @@ export type Conn:
 	// The transaction status of the last ReadyForQuery: `STATUS_IDLE`,
 	// `STATUS_IN_TRANSACTION` or `STATUS_FAILED`.
 	status: UInt8
+	binary_results: Bool
 
 fn server_error(fields: Map[String, String]) Error:
 	var details = Map[String, String]()
@@ -83,7 +88,7 @@ fn protocol(what: String) Error:
 
 // Makes at least `count` unread bytes available, joining chunks once so a large message
 // costs linear time.
-fn var Conn.need(count: Int) Unit!:
+fn var Conn.need(count: Int) Void!:
 	if self.buffer.length() - self.pos >= count: return ok(unit)
 
 	var joined = BytesBuilder()
@@ -136,7 +141,7 @@ fn var Conn.read() Backend!:
 
 	return error(protocol("unreachable"))
 
-fn var Conn.send(data: Bytes) Unit!:
+fn var Conn.send(data: Bytes) Void!:
 	self.net.output.write(data)?
 
 // Asks for TLS on the plain connection (SSLRequest), then upgrades the same socket. The
@@ -172,14 +177,23 @@ export fn open(config: Config) Conn!:
 	if options := config.tls:
 		net = negotiate_tls(var net, options, config.host, config.timeout.clone())?
 
-	var conn = Conn(net, Bytes([]), 0, Map[String, String](), 0, 0, STATUS_IDLE)
+	var conn = Conn(
+		net,
+		Bytes([]),
+		0,
+		Map[String, String](),
+		0,
+		0,
+		STATUS_IDLE,
+		config.binary_results,
+	)
 	var parameters = Map[String, String]()
 	parameters.add("application_name", config.application_name.clone())
 	conn.send(startup(config.user, config.database, parameters)?)?
 	conn.authenticate(config)?
 	return ok(conn)
 
-fn var Conn.authenticate(config: Config) Unit!:
+fn var Conn.authenticate(config: Config) Void!:
 	var scram = scram_start(config.password.clone())?
 	var in_scram = false
 	var server_verified = false
@@ -276,7 +290,11 @@ fn var Conn.collect(known: List[Field]) Rows!:
 						)
 						break
 
-					decoded := decode_value(fields[i].type_oid, columns[i].clone())
+					decoded := decode_value(
+						fields[i].type_oid,
+						fields[i].format,
+						columns[i].clone(),
+					)
 
 					if decoded.is_error():
 						if failure.is_none(): failure = decoded.err().clone()
@@ -306,32 +324,33 @@ fn var Conn.simple(sql: String) Rows!:
 fn var Conn.query(sql: String, params: List[Value]) Rows!:
 	var out = BytesBuilder()
 	out.append_bytes(parse("", sql, [])?)
-	out.append_bytes(bind("", "", params.map(fn p: encode_value(p)), false)?)
+	out.append_bytes(bind("", "", params.map(fn p: encode_value(p)), [])?)
 	out.append_bytes(describe(PORTAL, "")?)
 	out.append_bytes(execute("", 0)?)
 	out.append_bytes(sync()?)
 	self.send(out.build())?
 	return self.collect([])
 
-fn var Conn.begin() Unit!:
+fn var Conn.begin() Void!:
 	_ := self.simple("BEGIN")?
 	return ok(unit)
 
-fn var Conn.commit() Unit!:
+fn var Conn.commit() Void!:
 	_ := self.simple("COMMIT")?
 	return ok(unit)
 
-fn var Conn.rollback() Unit!:
+fn var Conn.rollback() Void!:
 	_ := self.simple("ROLLBACK")?
 	return ok(unit)
 
-fn var Conn.close() Unit!:
+fn var Conn.close() Void!:
 	_ := self.send(terminate()?)
 	return self.net.close()
 
 // A statement parsed once on the server and run many times.
 export type Prepared:
 	name: String
+	// The result columns, each with the format code the statement requests for it.
 	columns: List[Field]
 
 // Parses `sql` under `name` and learns its result columns.
@@ -359,13 +378,22 @@ fn var Conn.prepare(name: String, sql: String) Prepared!:
 
 	if f := failure: return error(f)
 
+	if self.binary_results:
+		columns = columns.map(
+			fn c: Field(
+				c.name.clone(),
+				c.type_oid,
+				if is_binary_type(c.type_oid): 1 else: 0,
+			)
+		)
 	return ok(Prepared(name.clone(), columns))
 
 // Runs a prepared statement: bind, execute and sync in one round trip.
 fn var Conn.run(statement: Prepared, params: List[Value]) Rows!:
 	var out = BytesBuilder()
+	formats := statement.columns.map(fn c: c.format)
 	out.append_bytes(
-		bind("", statement.name, params.map(fn p: encode_value(p)), false)?
+		bind("", statement.name, params.map(fn p: encode_value(p)), formats)?
 	)
 	out.append_bytes(execute("", 0)?)
 	out.append_bytes(sync()?)
