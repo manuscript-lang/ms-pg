@@ -1,16 +1,17 @@
 import (
 	Bytes from "@std/bytes.ms",
 	Promise, promise from "@std/concurrency/promise.ms",
-	collect, filter, fold, map, take from "@std/io/streams.ms",
+	collect, filter, fold, from_list, map, take from "@std/io/streams.ms",
 	Connection, listen from "@std/net/net.ms",
 	TlsOptions from "@std/net/tls.ms",
 	environment from "@std/os/env.ms",
 	read_file from "@std/os/fs.ms",
 	expect_equal, expect_error, expect_true from "@std/test/test.ms",
-	Timestamp from "@std/time.ms",
+	Timestamp, sleep from "@std/time.ms",
 
 	md5_password from "@pg/auth.ms",
-	Config, Conn, open from "@pg/conn.ms",
+	Batch, Config, Conn, Isolation, TxOptions, cancel, open from "@pg/conn.ms",
+	config_from_env, parse_config from "@pg/dsn.ms",
 	Pool, Statement, start from "@pg/pool.ms",
 	stream from "@pg/stream.ms",
 	Value from "@pg/value.ms",
@@ -409,3 +410,185 @@ test "stream sends rows as the server produces them":
 test "a stream ends with the server error":
 	failure := expect_error(collect(stream(config()?, "select 1/0", []), max_items: 10))?
 	expect_equal(failure.kind, "22012")?
+
+test "a URL connection string sets every part":
+	parsed := parse_config(
+		"postgres://app:p%40ss@db.example:6543/shop?application_name=web&statement_timeout=5s&sslmode=verify-full"
+	)?
+	expect_equal(parsed.user, "app")?
+	expect_equal(parsed.password, "p@ss")?
+	expect_equal(parsed.host, "db.example")?
+	expect_equal(parsed.port, 6543)?
+	expect_equal(parsed.database, "shop")?
+	expect_equal(parsed.application_name, "web")?
+	expect_equal(parsed.params.get_or("statement_timeout", ""), "5s")?
+	expect_true(parsed.tls.is_some())?
+
+test "a URL with an IPv6 host and no login":
+	parsed := parse_config("postgresql://[::1]:5433/db")?
+	expect_equal(parsed.host, "::1")?
+	expect_equal(parsed.port, 5433)?
+	expect_equal(parsed.user, "postgres")?
+	expect_true(parsed.tls.is_none())?
+
+test "a key value connection string with quotes":
+	parsed := parse_config(
+		"host=localhost port=5433 user=app password='a b' dbname=shop sslmode=disable"
+	)?
+	expect_equal(parsed.host, "localhost")?
+	expect_equal(parsed.password, "a b")?
+	expect_equal(parsed.database, "shop")?
+	expect_true(parsed.tls.is_none())?
+
+test "sslmodes that would weaken TLS are refused":
+	void expect_error(parse_config("host=h sslmode=prefer"))?
+	void expect_error(parse_config("host=h sslmode=require"))?
+	void expect_error(parse_config("host=h port=abc"))?
+
+test "libpq environment variables fill the config":
+	var env = Map[String, String]()
+	env.add("PGHOST", "db")
+	env.add("PGPORT", "6000")
+	env.add("PGSSLMODE", "verify-full")
+
+	parsed := config_from_env(env)?
+	expect_equal(parsed.host, "db")?
+	expect_equal(parsed.port, 6000)?
+	expect_true(parsed.tls.is_some())?
+
+test "a read only transaction rejects writes":
+	var conn = open(config()?)?
+	void conn.simple("create temp table ro (n int)")?
+
+	failure := expect_error(
+		conn.transaction_with(
+			TxOptions(isolation: Isolation.Serializable, read_only: true),
+			fn(var c: Conn): c.query("create schema ro_probe", [])
+		)
+	)?
+	expect_equal(failure.kind, "25006")?
+
+	level := conn.transaction_with(
+		TxOptions(isolation: Isolation.RepeatableRead),
+		fn(var c: Conn): c.query("show transaction_isolation", [])
+	)?
+	expect_equal(level.rows[0][0].text().get(""), "repeatable read")?
+	conn.close()?
+
+test "a nested transaction rolls back to its savepoint":
+	var conn = open(config()?)?
+	void conn.simple("create temp table sp (n int)")?
+
+	void conn.transaction(
+		fn(var c: Conn):
+			void c.query("insert into sp values (1)", [])?
+			void c.nested(
+				"inner",
+				fn(var d: Conn): d.query(
+					"insert into sp values (2)",
+					[],
+				)
+			)?
+			void c.nested(
+				"failing",
+				fn(var d: Conn): d.query(
+					"insert into sp values (1/0)",
+					[],
+				)
+			)
+			return c.query("insert into sp values (3)", [])
+	)?
+
+	rows := conn.query("select n from sp order by n", [])?
+	expect_equal(rows.rows.length(), 3)?
+	expect_equal(rows.rows[2][0].int().get(0), 3)?
+	conn.close()?
+
+test "listen delivers notifications from another connection":
+	var listener = open(config()?)?
+	var sender = open(config()?)?
+	listener.listen("jobs")?
+	sender.notify("jobs", "hello")?
+
+	got := listener.wait_for_notification()?
+	expect_equal(got.channel, "jobs")?
+	expect_equal(got.payload, "hello")?
+	expect_equal(got.pid, sender.pid)?
+
+	// A notification that arrives during a query is queued, not lost.
+	sender.notify("jobs", "queued")?
+	void listener.query("select 1", [])?
+
+	again := listener.wait_for_notification()?
+	expect_equal(again.payload, "queued")?
+	listener.close()?
+	sender.close()?
+
+fn cancel_soon(config: Config, pid: Int, secret: Int) Void!:
+	sleep(300.milliseconds()).wait()?
+	return cancel(config, pid, secret)
+
+test "cancel stops a running statement":
+	settings := config()?
+	var conn = open(settings)?
+	pid := conn.pid
+	secret := conn.secret
+	target := settings.clone()
+	stopping := promise(fn: cancel_soon(target, pid, secret))
+	failure := expect_error(conn.query("select pg_sleep(30)", []))?
+	expect_equal(failure.kind, "57014")?
+	stopping.wait()?
+
+	back := conn.query("select 1", [])?
+	expect_equal(back.rows[0][0].int().get(0), 1)?
+	conn.close()?
+
+test "a batch runs every statement in one round trip":
+	var conn = open(config()?)?
+	void conn.simple("create temp table bt (n int)")?
+
+	var batch = Batch(sql: [], params: [])
+	batch.add("insert into bt values ($1)", [Value.Int(1)])
+	batch.add("insert into bt values ($1)", [Value.Int(2)])
+	batch.add("select sum(n) from bt")
+
+	results := conn.send_batch(batch)?
+	expect_equal(results.length(), 3)?
+	expect_equal(results[0].command, "INSERT 0 1")?
+	expect_equal(results[2].rows[0][0].int().get(0), 3)?
+
+	var bad = Batch(sql: [], params: [])
+	bad.add("insert into bt values (3)")
+	bad.add("select 1/0")
+	void expect_error(conn.send_batch(bad))?
+
+	count := conn.query("select count(*) from bt", [])?
+	expect_equal(count.rows[0][0].int().get(0), 2)?
+	conn.close()?
+
+test "copy from loads rows from a stream and copy to reads them back":
+	var conn = open(config()?)?
+	void conn.simple("create temp table cp (id int, note text)")?
+
+	rows := [
+		[Value.Int(1), Value.Text("a\tb")],
+		[Value.Int(2), Value.Null],
+		[Value.Int(3), Value.Text("line\nbreak \\ slash")],
+	]
+	stored := conn.copy_from(["cp"], ["id", "note"], from_list(rows))?
+	expect_equal(stored, 3)?
+
+	back := conn.copy_to("copy (select id, note from cp order by id) to stdout")?
+	expect_equal(back.rows.length(), 3)?
+	expect_equal(back.rows[0][1].text().get(""), "a\tb")?
+	expect_true(back.rows[1][1].is_null())?
+	expect_equal(back.rows[2][1].text().get(""), "line\nbreak \\ slash")?
+
+	failure := expect_error(
+		conn.copy_from(["cp"], ["id"], from_list([[Value.Text("x")]]))
+	)?
+	expect_equal(failure.kind, "22P02")?
+
+	count := conn.query("select count(*) from cp", [])?
+	expect_equal(count.rows[0][0].int().get(0), 3)?
+	conn.close()?

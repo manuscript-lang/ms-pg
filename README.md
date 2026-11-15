@@ -69,6 +69,20 @@ fn main() Void!:
 `Pool` (`@pg/pool.ms`) runs statements on worker tasks that each own one connection. A connection cannot move
 between tasks, so statements travel to the workers over pipes and rows travel back; one task owns the `Pool`. `query_all` queues at most 32 statements per worker before reading replies, so any number of statements is safe. Pool statements use the text format.
 
+## Compatibility with pgx
+
+The names and behavior follow pgx where Manuscript's rules allow.
+
+- **Connection strings**: `parse_config` (`@pg/dsn.ms`) reads `postgres://user:pass@host:port/db?sslmode=verify-full` and `key=value` forms; `config_from_env(environment()?)` reads the `PG*` variables. Unknown keys become server settings in `Config.params`. `sslmode` is `disable` or `verify-full`; `prefer`, `allow` and `require` are refused, since each falls back to plaintext or skips certificate checks.
+- **Unix sockets**: a `host` that starts with `/` names the socket directory.
+- **Transactions**: `transaction_with(TxOptions(isolation: Isolation.Serializable, read_only: true), body)`, and `nested(name, body)` for a savepoint that rolls back alone.
+- **LISTEN/NOTIFY**: `listen`, `unlisten`, `notify` and `wait_for_notification`. Notifications that arrive during a statement are queued.
+- **Cancel**: `cancel(config, pid, secret)` from another task stops a running statement with SQLSTATE `57014`.
+- **Batch**: `Batch.add(sql, params)` then `conn.send_batch(batch)` sends every statement and one Sync in one round trip.
+- **COPY**: `conn.copy_from(["schema", "table"], columns, rows_stream)` takes a stream, so a pipeline feeds it; `conn.copy_to("copy (select ...) to stdout")` returns the lines. Both use the text format.
+
+Not covered yet: arrays and other composite types, binary parameters, multiple hosts and failover, client certificates from a connection string, tracing hooks, and large objects.
+
 ## Tests
 
 `eval $(tests/start-postgres.sh /tmp/pg)` starts a throwaway server with the roles the tests need, then `ms test`.

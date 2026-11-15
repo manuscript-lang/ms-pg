@@ -3,7 +3,7 @@ import (
 	Bytes, BytesBuilder from "@std/bytes.ms",
 	ReadStream from "@std/io/io.ms",
 	from_list from "@std/io/streams.ms",
-	Connection, connect, start_tls from "@std/net/net.ms",
+	Connection, connect, connect_unix, start_tls from "@std/net/net.ms",
 	TlsOptions from "@std/net/tls.ms",
 	Duration from "@std/time.ms",
 
@@ -15,6 +15,10 @@ import (
 	STATEMENT,
 	STATUS_IDLE,
 	bind,
+	cancel_request,
+	copy_data,
+	copy_done,
+	copy_fail,
 	decode_message,
 	describe,
 	execute,
@@ -30,6 +34,8 @@ import (
 	terminate from "@pg/wire.ms",
 )
 
+// A host that starts with `/` is a Unix socket directory (`/var/run/postgresql`), and
+// the socket is `.s.PGSQL.<port>` inside it. TLS does not apply to a Unix socket.
 // How to reach the server and which logins to accept.
 export type Config:
 	host: String = "127.0.0.1"
@@ -50,6 +56,9 @@ export type Config:
 	// as numeric, stay text. Off gives text for everything. The format only changes
 	// speed: every call path returns the same `Value` variants.
 	binary_results: Bool = true
+	// Extra server settings sent at startup, such as `search_path` or
+	// `statement_timeout`.
+	params: Map[String, String] = Map[String, String]()
 
 // The result of one statement.
 export type Rows:
@@ -82,6 +91,14 @@ export type Conn:
 	// `STATUS_IN_TRANSACTION` or `STATUS_FAILED`.
 	status: UInt8
 	binary_results: Bool
+	// NOTIFY messages that arrived while a statement was running, oldest first.
+	notifications: List[Notification]
+
+// One NOTIFY: the sending backend's process id, the channel and the payload.
+export type Notification:
+	pid: Int
+	channel: String
+	payload: String
 
 fn server_error(fields: Map[String, String]) Error:
 	var details = Map[String, String]()
@@ -122,25 +139,37 @@ fn var Conn.need(count: Int) Void!:
 	self.pos = 0
 	return ok()
 
-// Reads the next message, skipping notices, parameter changes and ignorable messages. A
-// server error arrives as `ErrorResponse`, since the server keeps the stream in step
-// after it.
+// Reads one framed message exactly as the server sent it.
+fn var Conn.frame() Backend!:
+	self.need(5)?
+
+	code := self.buffer.uint8(self.pos)?
+	size := i32(self.buffer, self.pos + 1)?
+	if size < 4: return error(protocol("invalid message length"))
+
+	self.need(size + 1)?
+
+	body := self.buffer.slice(self.pos + 5, self.pos + 1 + size)?
+	self.pos += 1 + size
+	return decode_message(code, body)
+
+// Reads the next message, skipping notices, parameter changes and ignorable messages,
+// and queueing notifications. A server error arrives as `ErrorResponse`, since the
+// server keeps the stream in step after it.
 fn var Conn.read() Backend!:
 	while true:
-		self.need(5)?
-
-		code := self.buffer.uint8(self.pos)?
-		size := i32(self.buffer, self.pos + 1)?
-		if size < 4: return error(protocol("invalid message length"))
-
-		self.need(size + 1)?
-
-		body := self.buffer.slice(self.pos + 5, self.pos + 1 + size)?
-		self.pos += 1 + size
-
-		message := decode_message(code, body)?
+		message := self.frame()?
 
 		match message:
+			Backend.Notification(pid, channel, payload):
+				self.notifications.append(
+					Notification(
+						pid,
+						channel.clone(),
+						payload.clone(),
+					)
+				)
+				continue
 			Backend.NoticeResponse(_): continue
 			Backend.Ignored: continue
 			Backend.ParameterStatus(name, value):
@@ -179,13 +208,32 @@ fn negotiate_tls(var net: Connection, tls: TlsOptions, host: String, timeout: Du
 	if options.server_name.is_empty(): options.server_name = host.clone()
 	return start_tls(var net, options, timeout)
 
-// Connects, authenticates, and returns a connection ready for queries.
-export fn open(config: Config) Conn!:
-	address := f"{config.host}:{config.port}"
-	var net = connect(address, none, config.timeout.clone()).wait()?
+// Opens the socket, and upgrades it to TLS when configured and the host is not a Unix
+// socket.
+fn dial(config: Config) Connection!:
+	if config.host.starts_with("/"):
+		return connect_unix(
+			f"{config.host}/.s.PGSQL.{config.port}",
+			config.timeout.clone(),
+		).wait()
+
+	var net = connect(f"{config.host}:{config.port}", none, config.timeout.clone()).wait()?
 	if options := config.tls:
 		net = negotiate_tls(var net, options, config.host, config.timeout.clone())?
+	return ok(net)
 
+// Asks the server to stop the statement a connection is running. Call it from another
+// task with the target's `pid` and `secret`, on a fresh connection that the server
+// closes at once; the target sees a `57014` error. The server sends no reply, so this
+// returns when the request is written.
+export fn cancel(config: Config, pid: Int, secret: Int) Void!:
+	var net = dial(config)?
+	net.output.write(cancel_request(pid, secret)?)?
+	return net.close()
+
+// Connects, authenticates, and returns a connection ready for queries.
+export fn open(config: Config) Conn!:
+	var net = dial(config)?
 	var conn = Conn(
 		net,
 		Bytes([]),
@@ -195,8 +243,9 @@ export fn open(config: Config) Conn!:
 		0,
 		STATUS_IDLE,
 		config.binary_results,
+		[],
 	)
-	var parameters = Map[String, String]()
+	var parameters = config.params.clone()
 	parameters.add("application_name", config.application_name.clone())
 	conn.send(startup(config.user, config.database, parameters)?)?
 	conn.authenticate(config)?
@@ -449,3 +498,345 @@ fn var Conn.transaction[T](body: fn(var Conn) T!) T!:
 
 	self.commit()?
 	return result
+
+// Transaction isolation levels.
+export enum Isolation:
+	Default
+	ReadUncommitted
+	ReadCommitted
+	RepeatableRead
+	Serializable
+
+// How a transaction starts: its isolation level, and whether it may write. `deferrable`
+// applies only to a serializable, read-only transaction.
+export type TxOptions:
+	isolation: Isolation = Isolation.Default
+	read_only: Bool = false
+	deferrable: Bool = false
+
+fn isolation_sql(level: Isolation) String:
+	match level:
+		Isolation.Default: return ""
+		Isolation.ReadUncommitted: return " ISOLATION LEVEL READ UNCOMMITTED"
+		Isolation.ReadCommitted: return " ISOLATION LEVEL READ COMMITTED"
+		Isolation.RepeatableRead: return " ISOLATION LEVEL REPEATABLE READ"
+		Isolation.Serializable: return " ISOLATION LEVEL SERIALIZABLE"
+
+// Starts a transaction with options.
+fn var Conn.begin_with(options: TxOptions) Void!:
+	var sql = f"BEGIN{isolation_sql(options.isolation)}"
+	if options.read_only: sql = f"{sql} READ ONLY"
+	if options.deferrable: sql = f"{sql} DEFERRABLE"
+	void self.simple(sql)?
+	return ok()
+
+// Like `transaction`, with options.
+fn var Conn.transaction_with[T](options: TxOptions, body: fn(var Conn) T!) T!:
+	self.begin_with(options)?
+
+	result := body(var self)
+
+	if result.is_error():
+		void self.rollback()
+		return result
+
+	self.commit()?
+	return result
+
+// Quotes an identifier: a table, column or savepoint name that may hold any character.
+export fn quote_ident(name: String) String:
+	return f"\"{name.replace("\"", "\"\"")}\""
+
+fn var Conn.savepoint(name: String) Void!:
+	void self.simple(f"SAVEPOINT {quote_ident(name)}")?
+	return ok()
+
+fn var Conn.release_savepoint(name: String) Void!:
+	void self.simple(f"RELEASE SAVEPOINT {quote_ident(name)}")?
+	return ok()
+
+fn var Conn.rollback_to(name: String) Void!:
+	void self.simple(f"ROLLBACK TO SAVEPOINT {quote_ident(name)}")?
+	return ok()
+
+// A nested transaction inside a running one: runs `body` between a savepoint and its
+// release, and rolls back to the savepoint, keeping the outer transaction usable, when
+// the body returns an error.
+fn var Conn.nested[T](name: String, body: fn(var Conn) T!) T!:
+	self.savepoint(name)?
+
+	result := body(var self)
+
+	if result.is_error():
+		void self.rollback_to(name)
+		void self.release_savepoint(name)
+		return result
+
+	self.release_savepoint(name)?
+	return result
+
+// Starts listening on a channel. Notifications queue on the connection while other
+// statements run.
+fn var Conn.listen(channel: String) Void!:
+	void self.simple(f"LISTEN {quote_ident(channel)}")?
+	return ok()
+
+fn var Conn.unlisten(channel: String) Void!:
+	void self.simple(f"UNLISTEN {quote_ident(channel)}")?
+	return ok()
+
+// Sends a notification to every connection listening on `channel`.
+fn var Conn.notify(channel: String, payload: String) Void!:
+	void self.query(
+		"select pg_notify($1, $2)",
+		[Value.Text(channel.clone()), Value.Text(payload.clone())],
+	)?
+	return ok()
+
+// Returns the next notification, waiting for one when none is queued. It blocks until
+// one arrives, so run it in its own task and close the connection to end the wait.
+fn var Conn.wait_for_notification() Notification!:
+	while true:
+		if not self.notifications.is_empty():
+			first := self.notifications.get(0).clone()
+			self.notifications.remove(0)
+			return ok(first)
+
+		message := self.frame()?
+
+		match message:
+			Backend.Notification(pid, channel, payload):
+				return ok(Notification(pid, channel.clone(), payload.clone()))
+			Backend.ParameterStatus(name, value): self.parameters.add(
+				name.clone(),
+				value.clone(),
+			)
+			_: continue
+
+	return error(protocol("unreachable"))
+
+// Statements run in one round trip. Build it with `add`, then run it with `send_batch`.
+export type Batch:
+	sql: List[String]
+	params: List[List[Value]]
+
+fn var Batch.add(statement: String, params: List[Value] = []) Void:
+	self.sql.append(statement.clone())
+	self.params.append(params.clone())
+
+fn Batch.length() Int:
+	return self.sql.length()
+
+// Sends every queued statement, then one Sync, and reads one `Rows` per statement. The
+// statements run in an implicit transaction: when one fails, the server skips the rest
+// and the error is returned, with none of the changes kept. All results use the text
+// format.
+fn var Conn.send_batch(batch: Batch) List[Rows]!:
+	var out = BytesBuilder()
+
+	for i in 0..batch.length():
+		out.append_bytes(parse("", batch.sql[i], [])?)
+		out.append_bytes(bind("", "", batch.params[i].map(fn p: encode_value(p)), [])?)
+		out.append_bytes(describe(PORTAL, "")?)
+		out.append_bytes(execute("", 0)?)
+
+	out.append_bytes(sync()?)
+	self.send(out.build())?
+
+	var results = List[Rows]()
+	var fields = List[Field]()
+	var rows = List[List[Value]]()
+	var failure: Error? = none
+
+	while true:
+		message := self.read()?
+
+		match message:
+			Backend.RowDescription(found): fields = found.clone()
+			Backend.DataRow(columns):
+				var row = List[Value]()
+
+				for i in 0..columns.length():
+					if i >= fields.length():
+						if failure.is_none(): failure = protocol(
+							"row has more columns than its description"
+						)
+						break
+
+					decoded := decode_value(
+						fields[i].type_oid,
+						fields[i].format,
+						columns[i].clone(),
+					)
+
+					if decoded.is_error():
+						if failure.is_none(): failure = decoded.err().clone()
+						break
+
+					row.append(decoded?)
+				rows.append(row)
+			Backend.CommandComplete(tag):
+				results.append(
+					Rows(
+						fields.map(fn f: f.name.clone()),
+						rows,
+						tag.clone(),
+					)
+				)
+				fields = []
+				rows = []
+			Backend.EmptyQuery:
+				results.append(Rows([], [], ""))
+				fields = []
+				rows = []
+			Backend.ErrorResponse(found):
+				if failure.is_none(): failure = server_error(found)
+			Backend.ReadyForQuery(status):
+				self.status = status
+				break
+			_: continue
+
+	if f := failure: return error(f)
+
+	return ok(results)
+
+// Escapes one value for COPY's text format; NULL is `\N`.
+fn copy_field(value: Value) String:
+	text := value.as_text()
+	if text.is_none(): return "\\N"
+
+	return text.get("").replace("\\", "\\\\").replace("\t", "\\t").replace(
+		"\n",
+		"\\n",
+	).replace("\r", "\\r")
+
+fn copy_line(row: List[Value]) Bytes:
+	return f"{row.map(fn v: copy_field(v)).join("\t")}\n".to_bytes()
+
+// Loads rows into a table with `COPY ... FROM STDIN`, in the text format, and returns
+// how many the server stored. `table` is the table's name parts
+// (`["public", "items"]`); the names are quoted. Rows come from a stream, so a pipeline
+// feeds it:
+// `conn.copy_from(["items"], ["id", "name"], rows | map(...))`. Rows are sent in
+// batches of at most 64 KiB. When the stream fails, the COPY is aborted and nothing is
+// stored.
+fn var Conn.copy_from(
+	table: List[String],
+	columns: List[String],
+	rows: ReadStream[List[Value]],
+) Int!:
+	target := table.map(fn t: quote_ident(t)).join(".")
+	names := if columns.is_empty(): "" else: f" ({columns.map(fn c: quote_ident(c)).join(", ")})"
+	self.send(query(f"COPY {target}{names} FROM STDIN")?)?
+
+	var failure: Error? = none
+
+	while true:
+		message := self.read()?
+
+		match message:
+			Backend.CopyInResponse: break
+			Backend.ErrorResponse(found):
+				failure = server_error(found)
+			Backend.ReadyForQuery(status):
+				self.status = status
+				if f := failure: return error(f)
+
+				return error(protocol("COPY did not start"))
+			_: continue
+
+	var pending = BytesBuilder()
+	var size = 0
+	var source = rows
+	var cause: Error? = none
+
+	while true:
+		next := source.next()
+
+		if next.is_error():
+			cause = next.err().clone()
+			break
+
+		item := next?
+		if item.is_none(): break
+
+		line := copy_line(item.get([]))
+		size += line.length()
+		pending.append_bytes(line)
+
+		if size >= 65536:
+			self.send(copy_data(pending.drain())?)?
+			size = 0
+
+	if cause.is_some():
+		self.send(copy_fail("input failed")?)?
+	else:
+		if size > 0: self.send(copy_data(pending.drain())?)?
+		self.send(copy_done()?)?
+
+	var tag = ""
+
+	while true:
+		message := self.read()?
+
+		match message:
+			Backend.CommandComplete(found): tag = found.clone()
+			Backend.ErrorResponse(found):
+				if failure.is_none(): failure = server_error(found)
+			Backend.ReadyForQuery(status):
+				self.status = status
+				break
+			_: continue
+
+	if c := cause: return error(c)
+	if f := failure: return error(f)
+
+	return ok(Rows([], [], tag).affected().get(0))
+
+fn unescape_copy(text: String) Value:
+	if text == "\\N": return Value.Null
+
+	// Split on an escaped backslash first, so its neighbours are read as plain text.
+	parts := text.split("\\\\", none).map(
+		fn part: part.replace("\\t", "\t").replace("\\n", "\n").replace(
+			"\\r",
+			"\r",
+		)
+	)
+	return Value.Text(parts.join("\\"))
+
+// Runs a `COPY ... TO STDOUT` statement, or `COPY (select ...) TO STDOUT`, and returns
+// each line as a row of `Text` values (`Null` for NULL), in the text format.
+fn var Conn.copy_to(sql: String) Rows!:
+	self.send(query(sql)?)?
+
+	var data = BytesBuilder()
+	var failure: Error? = none
+	var tag = ""
+
+	while true:
+		message := self.read()?
+
+		match message:
+			Backend.CopyData(chunk): data.append_bytes(chunk)
+			Backend.CommandComplete(found): tag = found.clone()
+			Backend.ErrorResponse(found):
+				if failure.is_none(): failure = server_error(found)
+			Backend.ReadyForQuery(status):
+				self.status = status
+				break
+			_: continue
+
+	if f := failure: return error(f)
+
+	text := data.build().decode_utf8().ok_or(
+		Error("postgres: COPY output is not valid UTF-8", kind: "EBADMSG")
+	)?
+	var rows = List[List[Value]]()
+
+	for line in text.split("\n", none):
+		if line.is_empty(): continue
+
+		rows.append(line.split("\t", none).map(fn field: unescape_copy(field)))
+
+	return ok(Rows([], rows, tag))

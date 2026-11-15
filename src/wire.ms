@@ -13,6 +13,10 @@ export COMMAND_COMPLETE: UInt8 := 67
 export ERROR_RESPONSE: UInt8 := 69
 export NOTICE_RESPONSE: UInt8 := 78
 export NOTIFICATION: UInt8 := 65
+COPY_IN_RESPONSE: UInt8 := 71
+COPY_OUT_RESPONSE: UInt8 := 72
+COPY_DATA: UInt8 := 100
+COPY_DONE: UInt8 := 99
 export NEGOTIATE_VERSION: UInt8 := 118
 export PARSE_COMPLETE: UInt8 := 49
 export BIND_COMPLETE: UInt8 := 50
@@ -31,6 +35,7 @@ CLOSE: UInt8 := 67
 SYNC: UInt8 := 83
 TERMINATE: UInt8 := 88
 PASSWORD: UInt8 := 112
+COPY_FAIL: UInt8 := 102
 // What `describe` and `close` name.
 export STATEMENT: UInt8 := 83
 export PORTAL: UInt8 := 80
@@ -68,7 +73,13 @@ export enum Backend:
 	ParameterDescription(oids: List[Int])
 	EmptyQuery
 	PortalSuspended
-	// Asynchronous or negotiation messages this client does not act on.
+	// An asynchronous NOTIFY from a channel this connection listens on.
+	Notification(pid: Int, channel: String, payload: String)
+	CopyInResponse
+	CopyOutResponse
+	CopyData(data: Bytes)
+	CopyDone
+	// Negotiation messages this client does not act on.
 	Ignored
 
 fn too_large() Error:
@@ -192,6 +203,27 @@ export fn close_statement(name: String) Bytes!:
 	cstring(var body, name)
 	return framed(CLOSE, body.build())
 
+// Frames for COPY: a chunk of data, the end of the data, and a client-side abort.
+export fn copy_data(data: Bytes) Bytes!:
+	return framed(COPY_DATA, data)
+
+export fn copy_done() Bytes!:
+	return framed(COPY_DONE, Bytes([]))
+
+export fn copy_fail(reason: String) Bytes!:
+	var body = BytesBuilder()
+	cstring(var body, reason)
+	return framed(COPY_FAIL, body.build())
+
+// A CancelRequest, sent alone on a fresh connection; it has no type byte.
+export fn cancel_request(pid: Int, secret: Int) Bytes!:
+	var out = BytesBuilder()
+	out.append_int32_be(16)
+	out.append_int32_be(80877102)
+	out.append_int32_be(size32(pid)?)
+	out.append_int32_be(size32(secret)?)
+	return ok(out.build())
+
 export fn execute(portal: String, max_rows: Int) Bytes!:
 	var body = BytesBuilder()
 	cstring(var body, portal)
@@ -313,7 +345,23 @@ export fn decode_message(code: UInt8, data: Bytes) Backend!:
 
 	if code == ERROR_RESPONSE: return ok(Backend.ErrorResponse(fields_of(data)?))
 	if code == NOTICE_RESPONSE: return ok(Backend.NoticeResponse(fields_of(data)?))
-	if code == NOTIFICATION or code == NEGOTIATE_VERSION: return ok(Backend.Ignored)
+	if code == NEGOTIATE_VERSION: return ok(Backend.Ignored)
+
+	if code == NOTIFICATION:
+		channel := read_cstring(data, 4)?
+		payload := read_cstring(data, channel.next)?
+		return ok(
+			Backend.Notification(
+				i32(data, 0)?,
+				channel.text.clone(),
+				payload.text.clone(),
+			)
+		)
+
+	if code == COPY_IN_RESPONSE: return ok(Backend.CopyInResponse)
+	if code == COPY_OUT_RESPONSE: return ok(Backend.CopyOutResponse)
+	if code == COPY_DATA: return ok(Backend.CopyData(data.clone()))
+	if code == COPY_DONE: return ok(Backend.CopyDone)
 	if code == PARSE_COMPLETE: return ok(Backend.ParseComplete)
 	if code == BIND_COMPLETE: return ok(Backend.BindComplete)
 	if code == CLOSE_COMPLETE: return ok(Backend.CloseComplete)
