@@ -22,6 +22,17 @@ without a zone is read as UTC), a `date` is `Value.Date` (days since 1970-01-01)
 `0.1::float4` is 0.10000000149011612 in both formats. Read values with `value.int()`, `float()`, `bool()`, `text()`,
 `bytes()`, `timestamp()`, `date()` (each `none` for another variant) and `is_null()`.
 
+## Pipelines
+
+`rows.stream()` is a `ReadStream`, so a result composes with the standard stream steps:
+
+```manuscript
+big := rows.stream() | filter(fn row: row[0].int().get(0) > 100) | map(fn row: row[1].text().get(""))
+names := collect(big, max_items: 1000)?
+```
+
+The stream owns a copy of an already-fetched result; the connection cannot yet stream rows as the server sends them (issue #9).
+
 ## Logins
 
 Only SCRAM-SHA-256 is accepted by default. A cleartext password is sent only over TLS. An md5 challenge is refused

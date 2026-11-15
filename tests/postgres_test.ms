@@ -1,6 +1,7 @@
 import (
 	Bytes from "@std/bytes.ms",
 	Promise, promise from "@std/concurrency/promise.ms",
+	collect, filter, fold, map from "@std/io/streams.ms",
 	Connection, listen from "@std/net/net.ms",
 	TlsOptions from "@std/net/tls.ms",
 	environment from "@std/os/env.ms",
@@ -357,3 +358,23 @@ test "a pool runs more statements than its pipes hold":
 	expect_equal(results.length(), 400)?
 	for n in 0..400: expect_equal(results[n].rows[0][0], Value.Int(n))?
 	pool.close()?
+
+test "rows compose with stream pipelines":
+	var conn = open(config()?)?
+	rows := conn.query("select n, n * 2 from generate_series(1, 10) n", [])?
+	evens := collect(
+		rows.stream() | filter(fn row: row[0].int().get(0) % 2 == 0) | map(
+			fn row: (row[1].int().get(0))
+		),
+		max_items: 10,
+	)?
+	expect_equal(evens, [4, 8, 12, 16, 20])?
+
+	total := fold(
+		rows.stream() | map(fn row: row[1].int().get(0)),
+		0,
+		fn sum,
+		n: (sum + n)
+	)?
+	expect_equal(total, 110)?
+	conn.close()?

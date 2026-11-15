@@ -1,6 +1,8 @@
 // One PostgreSQL connection: startup, authentication, queries and transactions.
 import (
 	Bytes, BytesBuilder from "@std/bytes.ms",
+	ReadStream from "@std/io/io.ms",
+	from_list from "@std/io/streams.ms",
 	Connection, connect, start_tls from "@std/net/net.ms",
 	TlsOptions from "@std/net/tls.ms",
 	Duration from "@std/time.ms",
@@ -55,6 +57,12 @@ export type Rows:
 	rows: List[List[Value]]
 	// The command tag, such as `SELECT 3` or `INSERT 0 1`.
 	command: String
+
+// The rows as a stream, so a result composes with the stream steps:
+// `rows.stream() | filter(fn row: ...) | map(fn row: ...) | collect(max_items: 100)`.
+// The stream owns a copy of the rows.
+fn Rows.stream() ReadStream[List[Value]]:
+	return from_list(self.rows.clone())
 
 // Rows changed, from a command tag such as `UPDATE 2`; none when the tag carries no
 // count.
