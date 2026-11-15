@@ -8,13 +8,9 @@ import (
 	Duration, Instant, monotonic from "@std/time.ms",
 
 	md5_password, scram_start from "@pg/auth.ms",
-	Param,
-	decode_value,
-	encode_param,
-	TypeInfo,
-	is_binary_type from "@pg/decode.ms",
-	Value, encode_value from "@pg/value.ms",
+	Param, TypeInfo, decode_value, encode_param, is_binary_type from "@pg/decode.ms",
 	interpolate, named from "@pg/sql.ms",
+	Value, encode_value from "@pg/value.ms",
 	Backend,
 	Field,
 	PORTAL,
@@ -59,6 +55,9 @@ export type Config:
 	// TLS negotiated with an SSLRequest on the plain connection, then the same socket
 	// is upgraded; none is plain TCP.
 	tls: TlsOptions? = none
+	// Opens a replication connection: `database` for logical replication, `true` for
+	// physical. See `@pg/replication.ms`.
+	replication: String = ""
 	// Accept an md5 password challenge. Off by default: md5 is weak, and SCRAM-SHA-256
 	// is always accepted.
 	allow_md5: Bool = false
@@ -281,9 +280,21 @@ fn var Conn.attrs_match(wanted: String) Bool!:
 	standby := recovery.rows[0][0].bool().get(false)
 	return ok(standby == (wanted == "standby" or wanted == "prefer-standby"))
 
+fn refuse_gss(_token: Bytes?) Bytes!:
+	return error(
+		Error("postgres: server asked for GSSAPI; use open_gss", kind: "EACCES")
+	)
+
+// Like `open` for a server that asks for GSSAPI or SSPI: `gss` is called with the
+// server's token (none at the start) and returns the token to send back, which may be
+// empty. Kerberos itself comes from the application's library, as in pgx. It opens
+// `host` only, with no failover.
+export fn open_gss(config: Config, gss: fn(Bytes?) Bytes!) Conn!:
+	return open_endpoint(config, gss)
+
 // Opens one server of `config` and checks it is the kind asked for.
 fn open_server(config: Config, wanted: String) Conn!:
-	var conn = open_endpoint(config)?
+	var conn = open_endpoint(config, refuse_gss)?
 	if conn.attrs_match(wanted)?: return ok(conn)
 
 	void conn.close()
@@ -323,7 +334,7 @@ export fn open(config: Config) Conn!:
 
 	return error(last)
 
-fn open_endpoint(config: Config) Conn!:
+fn open_endpoint(config: Config, gss: fn(Bytes?) Bytes!) Conn!:
 	var net = dial(config)?
 	var conn = Conn(
 		net,
@@ -343,11 +354,15 @@ fn open_endpoint(config: Config) Conn!:
 	)
 	var parameters = config.params.clone()
 	parameters.add("application_name", config.application_name.clone())
+	if not config.replication.is_empty(): parameters.add(
+		"replication",
+		config.replication.clone(),
+	)
 	conn.send(startup(config.user, config.database, parameters)?)?
-	conn.authenticate(config)?
+	conn.authenticate(config, gss)?
 	return ok(conn)
 
-fn var Conn.authenticate(config: Config) Void!:
+fn var Conn.authenticate(config: Config, gss: fn(Bytes?) Bytes!) Void!:
 	var scram = scram_start(config.password.clone())?
 	var in_scram = false
 	var server_verified = false
@@ -384,6 +399,11 @@ fn var Conn.authenticate(config: Config) Void!:
 						)
 					)
 				self.send(password(md5_password(config.user, config.password, salt))?)?
+			Backend.AuthGss:
+				self.send(sasl_response(gss(none)?)?)?
+			Backend.AuthGssContinue(data):
+				token := gss(data.clone())?
+				if token.length() > 0: self.send(sasl_response(token)?)?
 			Backend.AuthSasl(mechanisms):
 				if not mechanisms.contains("SCRAM-SHA-256"):
 					return error(protocol("server offers no SCRAM-SHA-256"))
@@ -870,7 +890,7 @@ fn var Conn.copy_in(
 	encode: fn(List[Value]) Bytes!,
 	head: Bytes,
 	tail: Bytes,
-	rows: ReadStream[List[Value]],
+	rows: ReadStream[List[Value]]
 ) Int!:
 	self.send(query(statement)?)?
 
@@ -891,6 +911,7 @@ fn var Conn.copy_in(
 
 	var pending = BytesBuilder()
 	pending.append_bytes(head)
+
 	var size = head.length()
 	var source = rows
 	var cause: Error? = none
@@ -906,6 +927,7 @@ fn var Conn.copy_in(
 		if item.is_none(): break
 
 		line := encode(item.get([]))
+
 		if line.is_error():
 			cause = line.err().clone()
 			break
@@ -964,13 +986,16 @@ fn var Conn.copy_from(
 		fn row: ok(copy_line(row)),
 		Bytes([]),
 		Bytes([]),
-		rows,
+		rows
 	)
 
 // One row of binary COPY: a field count, then each field as a length and its bytes.
 fn binary_copy_row(oids: List[Int], row: List[Value]) Bytes!:
 	if row.length() != oids.length(): return error(
-		Error("postgres: COPY row has the wrong number of columns", kind: "EINVAL")
+		Error(
+			"postgres: COPY row has the wrong number of columns",
+			kind: "EINVAL",
+		)
 	)
 
 	var out = BytesBuilder()
@@ -1002,10 +1027,14 @@ fn var Conn.copy_from_binary(
 	columns: List[String],
 	rows: ReadStream[List[Value]],
 ) Int!:
-	names := if columns.is_empty(): "*" else: columns.map(fn c: quote_ident(c)).join(", ")
-	probe := self.prepare("", f"select {names} from {table.map(fn t: quote_ident(t)).join(".")}")?
+	names := if columns.is_empty(): "*" else: columns.map(
+		fn c: quote_ident(c)
+	).join(", ")
+	probe := self.prepare(
+		"",
+		f"select {names} from {table.map(fn t: quote_ident(t)).join(".")}",
+	)?
 	oids := probe.columns.map(fn c: c.type_oid)
-
 	var head = BytesBuilder()
 	head.append_bytes(Bytes([80, 71, 67, 79, 80, 89, 10, 255, 13, 10, 0]))
 	head.append_int32_be(0)
@@ -1013,13 +1042,12 @@ fn var Conn.copy_from_binary(
 
 	var tail = BytesBuilder()
 	tail.append_int16_be(-1)
-
 	return self.copy_in(
 		f"COPY {copy_target(table, columns)} FROM STDIN (FORMAT binary)",
 		fn row: binary_copy_row(oids, row),
 		head.build(),
 		tail.build(),
-		rows,
+		rows
 	)
 
 fn unescape_copy(text: String) Value:
@@ -1213,3 +1241,9 @@ fn var Conn.query_named(sql: String, args: Map[String, Value]) Rows!:
 // The command's first word: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `COPY` and so on.
 fn Rows.verb() String:
 	return self.command.split(" ", none)[0].clone()
+
+// Frees every prepared statement on the server and forgets the cached ones.
+fn var Conn.deallocate_all() Void!:
+	void self.simple("DEALLOCATE ALL")?
+	self.statements.clear()
+	return ok()

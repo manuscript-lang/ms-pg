@@ -14,7 +14,12 @@ fn span(bytes: Bytes, from: Int, to: Int) String!:
 	return ok(piece.decode_utf8().get(""))
 
 fn is_word(c: Int) Bool:
-	return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+	return (
+		(c >= 48 and c <= 57)
+		or (c >= 65 and c <= 90)
+		or (c >= 97 and c <= 122)
+		or c == 95
+	)
 
 // A statement with `$n` placeholders and the values for them.
 export type NamedQuery:
@@ -54,7 +59,9 @@ fn quoted_end(bytes: Bytes, at: Int, quote: Int) Int:
 			if byte_at(bytes, i + 1) == quote:
 				i += 2
 				continue
+
 			return i + 1
+
 		i += 1
 
 	return bytes.length()
@@ -66,15 +73,19 @@ fn line_end(bytes: Bytes, at: Int) Int:
 
 fn block_end(bytes: Bytes, at: Int) Int:
 	var i = at + 2
-	while i < bytes.length() and not (byte_at(bytes, i) == 42 and byte_at(bytes, i + 1) == 47): i += 1
+	while (
+		i < bytes.length()
+		and not (byte_at(bytes, i) == 42 and byte_at(bytes, i + 1) == 47)
+	): i += 1
 	return (i + 2).min(bytes.length())
 
 fn emit(bytes: Bytes, at: Int, var out: List[String]) Int!:
 	out.append(span(bytes, at, at + 1)?)
 	return ok(1)
 
-// Turns `@name` placeholders into `$1`, `$2`, ... in order of first use, and collects the
-// values from `args`. A name missing from `args` is an error; `@@` stands for a literal
+// Turns `@name` placeholders into `$1`, `$2`, ... in order of first use, and collects
+// the values from `args`. A name missing from `args` is an error; `@@` stands for a
+// literal
 // `@`.
 export fn named(sql: String, args: Map[String, Value]) NamedQuery!:
 	var order = List[String]()
@@ -141,7 +152,10 @@ export fn interpolate(sql: String, params: List[Value]) String!:
 			digits := span(bytes, at + 1, end)?
 			number := digits.parse_int().get(0)
 			if number < 1 or number > params.length(): return error(
-				Error(f"postgres: no value for ${number}", kind: "EINVAL")
+				Error(
+					f"postgres: no value for ${number}",
+					kind: "EINVAL",
+				)
 			)
 
 			out.append(literal(params[number - 1])?)

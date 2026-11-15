@@ -69,7 +69,11 @@ fn Value.as_text() String?:
 			return f"{months} mons {days} days {micros} microseconds"
 		Value.Array(items): return array_literal(items)
 		Value.Range(bounds, flags): return range_literal(bounds, flags)
-		Value.Geometric(kind, numbers, closed): return geometric_literal(kind, numbers, closed)
+		Value.Geometric(kind, numbers, closed): return geometric_literal(
+			kind,
+			numbers,
+			closed,
+		)
 		Value.Inet(address, bits): return f"{address}/{bits}"
 		Value.Bits(length, data): return bits_literal(length, data)
 		Value.Time(micros): return clock_literal(micros)
@@ -81,15 +85,15 @@ fn Value.as_text() String?:
 			return f"{clock_literal(micros)}{sign}{hours}:{minutes}"
 		Value.Hstore(keys, values):
 			var pairs = List[String]()
+
 			for i in 0..keys.length():
 				value := values[i].as_text()
 				shown := if value.is_none(): "NULL" else: quoted(value.get(""))
 				pairs.append(f"{quoted(keys[i])}=>{shown}")
+
 			return pairs.join(", ")
 		Value.Composite(fields):
-			joined := fields.map(
-				fn field: composite_field(field)
-			).join(",")
+			joined := fields.map(fn field: composite_field(field)).join(",")
 			return f"({joined})"
 
 fn quoted(text: String) String:
@@ -99,6 +103,7 @@ fn quoted(text: String) String:
 fn composite_field(field: Value) String:
 	text := field.as_text()
 	if text.is_none(): return ""
+
 	return quoted(text.get(""))
 
 fn clock_literal(micros: Int) String:
@@ -122,6 +127,7 @@ fn bits_literal(length: Int, data: Bytes) String:
 fn range_bound(bound: Value) String:
 	text := bound.as_text()
 	if text.is_none(): return ""
+
 	return quoted(text.get(""))
 
 fn range_literal(bounds: List[Value], flags: Int) String:
@@ -134,9 +140,11 @@ fn range_literal(bounds: List[Value], flags: Int) String:
 fn points(numbers: List[Float]) List[String]:
 	var out = List[String]()
 	var i = 0
+
 	while i + 1 < numbers.length():
 		out.append(f"({numbers[i]},{numbers[i + 1]})")
 		i += 2
+
 	return out
 
 fn geometric_literal(kind: String, numbers: List[Float], closed: Bool) String:
@@ -146,6 +154,7 @@ fn geometric_literal(kind: String, numbers: List[Float], closed: Bool) String:
 	if kind == "line": return f"\{{numbers[0]},{numbers[1]},{numbers[2]}\}"
 	if kind == "circle": return f"<({numbers[0]},{numbers[1]}),{numbers[2]}>"
 	if kind == "path" and not closed: return f"[{points(numbers).join(",")}]"
+
 	return f"({points(numbers).join(",")})"
 
 // Quotes one array element: a backslash or double quote is escaped.
@@ -226,4 +235,3 @@ export fn encode_value(value: Value) Bytes?:
 	if text.is_none(): return none
 
 	return text.get("").to_bytes()
-

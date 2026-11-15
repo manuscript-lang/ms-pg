@@ -8,8 +8,8 @@ import (
 	Value, encode_value from "@pg/value.ms",
 )
 
-// A type the server defines by name (an enum, a composite, a domain, an extension type),
-// registered with `Conn.load_types` so its columns can be decoded.
+// A type the server defines by name (an enum, a composite, a domain, an extension
+// type), registered with `Conn.load_types` so its columns can be decoded.
 export type TypeInfo:
 	// `enum`, `composite`, `domain`, `range`, `multirange`, `array` or `hstore`.
 	kind: String
@@ -140,7 +140,12 @@ type ArrayPart:
 	next: Int
 
 // Reads the array whose `{` is at byte `at`, and returns the byte after its `}`.
-fn parse_array(bytes: Bytes, at: Int, element_oid: Int, types: Map[Int, TypeInfo]) ArrayPart!:
+fn parse_array(
+	bytes: Bytes,
+	at: Int,
+	element_oid: Int,
+	types: Map[Int, TypeInfo],
+) ArrayPart!:
 	var items = List[Value]()
 	var i = at + 1
 	if bytes.get(i) == 125: return ok(ArrayPart(items, i + 1))
@@ -308,7 +313,8 @@ fn read_piece(bytes: Bytes, at: Int, stops: List[Int]) Piece!:
 	text := raw.build().decode_utf8().ok_or(bad("value", "invalid UTF-8"))?
 	return ok(Piece(text, false, i))
 
-// The subtype of a range type: the built-in ranges, or one registered with `load_types`.
+// The subtype of a range type: the built-in ranges, or one registered with
+// `load_types`.
 fn range_subtype(type_oid: Int, types: Map[Int, TypeInfo]) Int?:
 	if type_oid == 3904: return INT4
 	if type_oid == 3906: return NUMERIC
@@ -319,7 +325,6 @@ fn range_subtype(type_oid: Int, types: Map[Int, TypeInfo]) Int?:
 
 	if known := types.get(type_oid):
 		if known.kind == "range": return known.element
-
 	return none
 
 fn multirange_subtype(type_oid: Int, types: Map[Int, TypeInfo]) Int?:
@@ -332,7 +337,6 @@ fn multirange_subtype(type_oid: Int, types: Map[Int, TypeInfo]) Int?:
 
 	if known := types.get(type_oid):
 		if known.kind == "multirange": return known.element
-
 	return none
 
 type ValuePart:
@@ -344,7 +348,12 @@ fn bound_value(piece: Piece, subtype: Int, types: Map[Int, TypeInfo]) Value!:
 	return decode_text(subtype, piece.text, types)
 
 // Reads one range such as `[1,5)`, `(,3]` or `empty` starting at `at`.
-fn parse_range(bytes: Bytes, at: Int, subtype: Int, types: Map[Int, TypeInfo]) ValuePart!:
+fn parse_range(
+	bytes: Bytes,
+	at: Int,
+	subtype: Int,
+	types: Map[Int, TypeInfo],
+) ValuePart!:
 	if byte_at(bytes, at) == 101:
 		return ok(ValuePart(Value.Range([Value.Null, Value.Null], 4), at + 5))
 
@@ -378,7 +387,11 @@ fn decode_text_multirange(subtype: Int, text: String, types: Map[Int, TypeInfo])
 	return ok(Value.Array(items))
 
 // Reads a composite such as `(1,"a b",)`.
-fn decode_text_composite(oids: List[Int], text: String, types: Map[Int, TypeInfo]) Value!:
+fn decode_text_composite(
+	oids: List[Int],
+	text: String,
+	types: Map[Int, TypeInfo],
+) Value!:
 	bytes := text.to_bytes()
 	var fields = List[Value]()
 	var i = 1
@@ -415,8 +428,10 @@ fn decode_text_hstore(text: String) Value!:
 		i = key.next + 2
 
 		value := read_piece(bytes, i, [44])?
+
 		if not value.quoted and value.text == "NULL": values.append(Value.Null)
 		else: values.append(Value.Text(value.text.clone()))
+
 		i = value.next
 
 	return ok(Value.Hstore(keys, values))
@@ -429,14 +444,12 @@ fn geometry_kind(type_oid: Int) String?:
 	if type_oid == POLYGON: return "polygon"
 	if type_oid == LINE: return "line"
 	if type_oid == CIRCLE: return "circle"
+
 	return none
 
 fn decode_text_geometry(kind: String, text: String) Value!:
-	flat := text.map_chars(
-		fn c: if "()[]{}<>,".contains_any(c): " " else: c
-	)
+	flat := text.map_chars(fn c: if "()[]{}<>,".contains_any(c): " " else: c)
 	var numbers = List[Float]()
-
 	for word in flat.fields():
 		numbers.append(word.parse_float().ok_or(bad(kind, text))?)
 
@@ -500,6 +513,7 @@ fn decode_text_timetz(text: String) Value!:
 
 	for i in 1..text.length():
 		c := text.slice(i, i + 1)?
+
 		if c == "+" or c == "-":
 			cut = i
 			break
@@ -512,15 +526,22 @@ fn decode_text_timetz(text: String) Value!:
 	offset := zone.slice(1, zone.length())?
 	parts := offset.split(":", none)
 	var seconds = parts[0].parse_int().ok_or(bad("timetz", text))? * 3600
-	if parts.length() > 1: seconds += parts[1].parse_int().ok_or(bad("timetz", text))? * 60
+	if parts.length() > 1: seconds += (
+		parts[1].parse_int().ok_or(bad("timetz", text))?
+		* 60
+	)
 	if parts.length() > 2: seconds += parts[2].parse_int().ok_or(bad("timetz", text))?
 	return ok(Value.TimeTz(micros, sign * seconds))
 
 // Text decoding of the types above and of registered types; none when the OID is
 // neither.
 fn decode_text_extra(type_oid: Int, text: String, types: Map[Int, TypeInfo]) Value?!:
-	if subtype := range_subtype(type_oid, types): return ok(decode_text_range(subtype, text, types)?)
-	if subtype := multirange_subtype(type_oid, types): return ok(decode_text_multirange(subtype, text, types)?)
+	if subtype := range_subtype(type_oid, types): return ok(
+		decode_text_range(subtype, text, types)?
+	)
+	if subtype := multirange_subtype(type_oid, types): return ok(
+		decode_text_multirange(subtype, text, types)?
+	)
 	if kind := geometry_kind(type_oid): return ok(decode_text_geometry(kind, text)?)
 	if type_oid == INET or type_oid == CIDR: return ok(decode_text_inet(text)?)
 	if type_oid == BIT or type_oid == VARBIT: return ok(decode_text_bits(text)?)
@@ -528,10 +549,14 @@ fn decode_text_extra(type_oid: Int, text: String, types: Map[Int, TypeInfo]) Val
 	if type_oid == TIMETZ: return ok(decode_text_timetz(text)?)
 
 	if known := types.get(type_oid):
-		if known.kind == "composite": return ok(decode_text_composite(known.fields, text, types)?)
+		if known.kind == "composite": return ok(
+			decode_text_composite(known.fields, text, types)?
+		)
 		if known.kind == "hstore": return ok(decode_text_hstore(text)?)
 		if known.kind == "domain": return ok(decode_text(known.element, text, types)?)
-		if known.kind == "array": return ok(decode_text_array(known.element, text, types)?)
+		if known.kind == "array": return ok(
+			decode_text_array(known.element, text, types)?
+		)
 
 	return ok(none)
 
@@ -568,7 +593,12 @@ fn decode_text(type_oid: Int, text: String, types: Map[Int, TypeInfo]) Value!:
 // Decodes one column by the column's type OID and format code (0 text, 1 binary). Both
 // formats give the same `Value` variant for a type; a value that does not parse is an
 // error.
-export fn decode_value(type_oid: Int, format: Int, raw: Bytes?, types: Map[Int, TypeInfo]) Value!:
+export fn decode_value(
+	type_oid: Int,
+	format: Int,
+	raw: Bytes?,
+	types: Map[Int, TypeInfo],
+) Value!:
 	if raw.is_none(): return ok(Value.Null)
 
 	bytes := raw.get(Bytes([]))
@@ -583,12 +613,21 @@ export fn decode_value(type_oid: Int, format: Int, raw: Bytes?, types: Map[Int, 
 export fn is_binary_type(type_oid: Int, types: Map[Int, TypeInfo]) Bool:
 	if element := element_of(type_oid): return is_binary_type(element, types)
 	if subtype := range_subtype(type_oid, types): return is_binary_type(subtype, types)
-	if subtype := multirange_subtype(type_oid, types): return is_binary_type(subtype, types)
+	if subtype := multirange_subtype(type_oid, types): return is_binary_type(
+		subtype,
+		types,
+	)
 	if geometry_kind(type_oid).is_some(): return true
 
 	if known := types.get(type_oid):
-		if known.kind == "array" or known.kind == "domain": return is_binary_type(known.element, types)
-		if known.kind == "composite": return known.fields.all(fn oid: is_binary_type(oid, types))
+		if known.kind == "array" or known.kind == "domain": return is_binary_type(
+			known.element,
+			types,
+		)
+		if known.kind == "composite": return known.fields.all(
+			fn oid: is_binary_type(oid, types)
+		)
+
 		return known.kind == "enum" or known.kind == "hstore"
 
 	return (
@@ -713,7 +752,6 @@ fn decode_binary(type_oid: Int, bytes: Bytes, types: Map[Int, TypeInfo]) Value!:
 		)
 
 	if extra := decode_binary_extra(type_oid, bytes, types)?: return ok(extra)
-
 	if type_oid == JSON: return decode_binary_text(JSON, bytes, types)
 
 	if type_oid == JSONB:
@@ -755,7 +793,13 @@ fn binary_dimension(
 			if size < 0:
 				items.append(Value.Null)
 			else:
-				items.append(decode_binary(element_oid, bytes.slice(i, i + size)?, types)?)
+				items.append(
+					decode_binary(
+						element_oid,
+						bytes.slice(i, i + size)?,
+						types,
+					)?
+				)
 				i += size
 
 	return ok(ValuePart(Value.Array(items), i))
@@ -768,7 +812,14 @@ fn decode_binary_array(bytes: Bytes, types: Map[Int, TypeInfo]) Value!:
 	var lengths = List[Int]()
 	for d in 0..dimensions: lengths.append(int32_at(bytes, 12 + 8 * d)?)
 
-	parsed := binary_dimension(bytes, lengths, 0, 12 + 8 * dimensions, element_oid, types)?
+	parsed := binary_dimension(
+		bytes,
+		lengths,
+		0,
+		12 + 8 * dimensions,
+		element_oid,
+		types,
+	)?
 	return ok(parsed.value)
 
 fn decode_binary_range(subtype: Int, bytes: Bytes, types: Map[Int, TypeInfo]) Value!:
@@ -787,19 +838,35 @@ fn decode_binary_range(subtype: Int, bytes: Bytes, types: Map[Int, TypeInfo]) Va
 			bounds.append(Value.Null)
 		else:
 			size := int32_at(bytes, i)?
-			bounds.append(decode_binary(subtype, bytes.slice(i + 4, i + 4 + size)?, types)?)
+			bounds.append(
+				decode_binary(
+					subtype,
+					bytes.slice(i + 4, i + 4 + size)?,
+					types,
+				)?
+			)
 			i += 4 + size
 
 	return ok(Value.Range(bounds, flags))
 
-fn decode_binary_multirange(subtype: Int, bytes: Bytes, types: Map[Int, TypeInfo]) Value!:
+fn decode_binary_multirange(
+	subtype: Int,
+	bytes: Bytes,
+	types: Map[Int, TypeInfo],
+) Value!:
 	count := int32_at(bytes, 0)?
 	var items = List[Value]()
 	var i = 4
 
 	for _n in 0..count:
 		size := int32_at(bytes, i)?
-		items.append(decode_binary_range(subtype, bytes.slice(i + 4, i + 4 + size)?, types)?)
+		items.append(
+			decode_binary_range(
+				subtype,
+				bytes.slice(i + 4, i + 4 + size)?,
+				types,
+			)?
+		)
 		i += 4 + size
 
 	return ok(Value.Array(items))
@@ -858,12 +925,22 @@ fn floats(bytes: Bytes, from: Int, count: Int) List[Float]!:
 
 fn decode_binary_geometry(kind: String, bytes: Bytes) Value!:
 	if kind == "point": return ok(Value.Geometric(kind, floats(bytes, 0, 2)?, false))
-	if kind == "lseg" or kind == "box": return ok(Value.Geometric(kind, floats(bytes, 0, 4)?, false))
-	if kind == "line" or kind == "circle": return ok(Value.Geometric(kind, floats(bytes, 0, 3)?, false))
+	if kind == "lseg" or kind == "box": return ok(
+		Value.Geometric(kind, floats(bytes, 0, 4)?, false)
+	)
+	if kind == "line" or kind == "circle": return ok(
+		Value.Geometric(kind, floats(bytes, 0, 3)?, false)
+	)
 
 	if kind == "path":
 		count := int32_at(bytes, 1)?
-		return ok(Value.Geometric(kind, floats(bytes, 5, count * 2)?, bytes.get(0) != 0))
+		return ok(
+			Value.Geometric(
+				kind,
+				floats(bytes, 5, count * 2)?,
+				bytes.get(0) != 0,
+			)
+		)
 
 	count := int32_at(bytes, 0)?
 	return ok(Value.Geometric(kind, floats(bytes, 4, count * 2)?, true))
@@ -879,9 +956,11 @@ fn ipv6_text(groups: List[Int]) String:
 		if groups[i] == 0:
 			var j = i
 			while j < 8 and groups[j] == 0: j += 1
+
 			if j - i > best_length and j - i >= 2:
 				best_start = i
 				best_length = j - i
+
 			i = j
 		else:
 			i += 1
@@ -906,7 +985,9 @@ fn decode_binary_inet(bytes: Bytes) Value!:
 		return ok(Value.Inet(parts.map(fn b: f"{b}").join("."), bits))
 
 	var groups = List[Int]()
-	for g in 0..8: groups.append(bytes.get(4 + 2 * g).to_int() * 256 + bytes.get(5 + 2 * g).to_int())
+	for g in 0..8: groups.append(
+		bytes.get(4 + 2 * g).to_int() * 256 + bytes.get(5 + 2 * g).to_int()
+	)
 	return ok(Value.Inet(ipv6_text(groups), bits))
 
 fn decode_binary_bits(bytes: Bytes) Value!:
@@ -915,27 +996,40 @@ fn decode_binary_bits(bytes: Bytes) Value!:
 
 fn decode_binary_macaddr(bytes: Bytes) Value:
 	var parts = List[String]()
-	for b in bytes.values(): parts.append(b.to_int().to_string_radix(16).pad_start(2, "0"))
+	for b in bytes.values(): parts.append(
+		b.to_int().to_string_radix(16).pad_start(2, "0")
+	)
 	return Value.Text(parts.join(":"))
 
 // Binary decoding of the types above and of registered types; none when the OID is
 // neither.
 fn decode_binary_extra(type_oid: Int, bytes: Bytes, types: Map[Int, TypeInfo]) Value?!:
 	if element_of(type_oid).is_some(): return ok(decode_binary_array(bytes, types)?)
-	if subtype := range_subtype(type_oid, types): return ok(decode_binary_range(subtype, bytes, types)?)
-	if subtype := multirange_subtype(type_oid, types): return ok(decode_binary_multirange(subtype, bytes, types)?)
+	if subtype := range_subtype(type_oid, types): return ok(
+		decode_binary_range(subtype, bytes, types)?
+	)
+	if subtype := multirange_subtype(type_oid, types): return ok(
+		decode_binary_multirange(subtype, bytes, types)?
+	)
 	if kind := geometry_kind(type_oid): return ok(decode_binary_geometry(kind, bytes)?)
 	if type_oid == INET or type_oid == CIDR: return ok(decode_binary_inet(bytes)?)
 	if type_oid == BIT or type_oid == VARBIT: return ok(decode_binary_bits(bytes)?)
-	if type_oid == MACADDR or type_oid == MACADDR8: return ok(decode_binary_macaddr(bytes))
+	if type_oid == MACADDR or type_oid == MACADDR8: return ok(
+		decode_binary_macaddr(bytes)
+	)
 	if type_oid == TIME: return ok(Value.Time(bytes.int64_be(0)?))
-	if type_oid == TIMETZ: return ok(Value.TimeTz(bytes.int64_be(0)?, -int32_at(bytes, 8)?))
+	if type_oid == TIMETZ: return ok(
+		Value.TimeTz(bytes.int64_be(0)?, -int32_at(bytes, 8)?)
+	)
 
 	if known := types.get(type_oid):
 		if known.kind == "array": return ok(decode_binary_array(bytes, types)?)
 		if known.kind == "composite": return ok(decode_binary_composite(bytes, types)?)
 		if known.kind == "hstore": return ok(decode_binary_hstore(bytes)?)
-		if known.kind == "domain": return ok(decode_binary(known.element, bytes, types)?)
+		if known.kind == "domain": return ok(
+			decode_binary(known.element, bytes, types)?
+		)
+
 		if known.kind == "enum":
 			text := bytes.decode_utf8().ok_or(bad("enum", "invalid UTF-8"))?
 			return ok(Value.Text(text))

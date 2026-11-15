@@ -17,6 +17,7 @@ COPY_IN_RESPONSE: UInt8 := 71
 COPY_OUT_RESPONSE: UInt8 := 72
 COPY_DATA: UInt8 := 100
 COPY_DONE: UInt8 := 99
+COPY_BOTH_RESPONSE: UInt8 := 87
 export NEGOTIATE_VERSION: UInt8 := 118
 export PARSE_COMPLETE: UInt8 := 49
 export BIND_COMPLETE: UInt8 := 50
@@ -54,6 +55,9 @@ export type Field:
 export enum Backend:
 	AuthOk
 	AuthCleartext
+	// GSSAPI or SSPI: the exchange runs through `Config.gss`.
+	AuthGss
+	AuthGssContinue(data: Bytes)
 	AuthMd5(salt: Bytes)
 	AuthSasl(mechanisms: List[String])
 	AuthSaslContinue(data: Bytes)
@@ -77,6 +81,8 @@ export enum Backend:
 	Notification(pid: Int, channel: String, payload: String)
 	CopyInResponse
 	CopyOutResponse
+	// The server switched a replication connection to streaming both ways.
+	CopyBothResponse
 	CopyData(data: Bytes)
 	CopyDone
 	// Negotiation messages this client does not act on.
@@ -91,14 +97,14 @@ fn size32(count: Int) Int32!:
 fn count16(count: Int) Int16!:
 	return count.to_int16().ok_or(too_large())
 
-fn framed(code: UInt8, body: Bytes) Bytes!:
+export fn framed(code: UInt8, body: Bytes) Bytes!:
 	var out = BytesBuilder()
 	out.append(code)
 	out.append_int32_be(size32(body.length() + 4)?)
 	out.append_bytes(body)
 	return ok(out.build())
 
-fn cstring(var out: BytesBuilder, text: String) Void:
+export fn cstring(var out: BytesBuilder, text: String) Void:
 	out.append_bytes(text.to_bytes())
 	out.append(0)
 
@@ -306,6 +312,8 @@ fn authentication(data: Bytes) Backend!:
 	if kind == 0: return ok(Backend.AuthOk)
 	if kind == 3: return ok(Backend.AuthCleartext)
 	if kind == 5: return ok(Backend.AuthMd5(rest))
+	if kind == 7 or kind == 9: return ok(Backend.AuthGss)
+	if kind == 8: return ok(Backend.AuthGssContinue(rest))
 	if kind == 11: return ok(Backend.AuthSaslContinue(rest))
 	if kind == 12: return ok(Backend.AuthSaslFinal(rest))
 	if kind != 10: return error(
@@ -363,6 +371,7 @@ export fn decode_message(code: UInt8, data: Bytes) Backend!:
 
 	if code == COPY_IN_RESPONSE: return ok(Backend.CopyInResponse)
 	if code == COPY_OUT_RESPONSE: return ok(Backend.CopyOutResponse)
+	if code == COPY_BOTH_RESPONSE: return ok(Backend.CopyBothResponse)
 	if code == COPY_DATA: return ok(Backend.CopyData(data.clone()))
 	if code == COPY_DONE: return ok(Backend.CopyDone)
 	if code == PARSE_COMPLETE: return ok(Backend.ParseComplete)

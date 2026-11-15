@@ -1,5 +1,6 @@
 // Connection strings and environment variables, in the forms pgx and libpq accept.
 import (
+	parse_ini from "@std/data/config.ms",
 	TlsOptions from "@std/net/tls.ms",
 	decode_component from "@std/net/url.ms",
 	Duration from "@std/time.ms",
@@ -221,4 +222,60 @@ export fn config_from_env(env: Map[String, String]) Config!:
 		parts := entry.split("=", none)
 		if value := env.get(parts[0]): apply(var config, parts[1], value)?
 
+	return ok(config)
+
+// Splits a `.pgpass` line on colons, honouring `\:` and `\\`.
+fn pgpass_fields(line: String) List[String]:
+	var fields = List[String]()
+	var current = ""
+	var escaped = false
+
+	for i in 0..line.length():
+		c := line.slice(i, i + 1).get("")
+
+		if escaped:
+			current = f"{current}{c}"
+			escaped = false
+		else if c == "\\": escaped = true
+		else if c == ":":
+			fields.append(current)
+			current = ""
+		else: current = f"{current}{c}"
+
+	fields.append(current)
+	return fields
+
+// Finds the password for a server in the text of a `.pgpass` file: lines of
+// `host:port:database:user:password`, each field `*` to match anything, `#` for
+// comments. The first matching line wins. Read the file with `@std/os/fs.ms`; this
+// package reads no files.
+export fn pgpass_password(
+	text: String,
+	host: String,
+	port: Int,
+	database: String,
+	user: String,
+) String?:
+	wanted := [host, f"{port}", database, user]
+
+	for line in text.split("\n", none):
+		if line.is_empty() or line.starts_with("#"): continue
+
+		fields := pgpass_fields(line)
+		if fields.length() != 5: continue
+
+		var matches = true
+		for i in 0..4:
+			if fields[i] != "*" and fields[i] != wanted[i]: matches = false
+		if matches: return fields[4].clone()
+
+	return none
+
+// Reads one `[name]` section of a `pg_service.conf` file; the keys are those of a
+// connection string.
+export fn parse_service(text: String, name: String) Config!:
+	sections := parse_ini(text)?
+	section := sections.get(name).ok_or(invalid(f"no service {name}"))?
+	var config = Config()
+	for entry in section: apply(var config, entry.key.clone(), entry.value.clone())?
 	return ok(config)
