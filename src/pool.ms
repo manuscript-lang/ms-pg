@@ -13,13 +13,33 @@ import (
 export type Statement:
 	sql: String
 	params: List[Value] = []
+	// Send each row back as it arrives, then one closing reply (`Pool.each`).
+	stream: Bool = false
 
+// One message from a worker: a whole result, a failure, or (streaming) one row. A
+// streamed statement ends with a reply that has no `row`: its `rows` hold the column
+// names and command tag only, or `failure` is set.
 export type Reply:
 	rows: Rows
 	failure: Error?
+	row: List[Value]? = none
 
 fn failed(cause: Error) Reply:
 	return Reply(Rows([], [], ""), cause)
+
+fn send_row(var replies: WriteStream[Reply], row: List[Value]) Void!:
+	return replies.write(Reply(Rows([], [], ""), none, row))
+
+// Runs one streamed statement, writing a reply per row and a closing reply.
+fn serve_streaming(var conn: Conn, request: Statement, var replies: WriteStream[Reply]) Void!:
+	result := conn.run_streaming(
+		request.sql,
+		request.params,
+		fn row: send_row(var replies, row)
+	)
+	if result.is_error(): return replies.write(failed(result.err().clone()))
+
+	return replies.write(Reply(result?, none))
 
 // Answers every request with the connect failure.
 fn drain(
@@ -37,6 +57,10 @@ fn serve(
 	var replies: WriteStream[Reply],
 ) Void!:
 	for request in requests:
+		if request.stream:
+			serve_streaming(var conn, request, var replies)?
+			continue
+
 		result := conn.query(request.sql, request.params)
 
 		if result.is_error():
@@ -113,16 +137,44 @@ fn var Pool.submit(statement: Statement) Int!:
 	self.slots[index].requests.write(statement.clone())?
 	return ok(index)
 
-fn var Pool.take(index: Int) Rows!:
+fn var Pool.reply(index: Int) Reply!:
 	reply := self.slots[index].replies.next()?
 	if reply.is_none(): return error(
 		Error("postgres: pool worker stopped", kind: "ECONNRESET")
 	)
 
-	got := reply.get(failed(Error("postgres: no reply")))
+	return ok(reply.get(failed(Error("postgres: no reply"))))
+
+fn var Pool.take(index: Int) Rows!:
+	got := self.reply(index)?
 	if f := got.failure: return error(f.clone())
 
 	return ok(got.rows.clone())
+
+// Runs one statement on a pooled connection and hands each row to `each` as the server
+// sends it, so a large result never sits in memory. The result holds the column names
+// and command tag, with no rows. If `each` fails, the rest of the result is read and
+// dropped so the worker stays in step, and the first error is returned.
+fn var Pool.each(sql: String, params: List[Value], each: fn(List[Value]) Void!) Rows!:
+	index := self.submit(Statement(sql.clone(), params.clone(), true))?
+	var failure: Error? = none
+
+	while true:
+		got := self.reply(index)?
+
+		if row := got.row:
+			if failure.is_none():
+				handled := each(row)
+				if handled.is_error(): failure = handled.err().clone()
+
+			continue
+
+		if f := failure: return error(f)
+		if f := got.failure: return error(f.clone())
+
+		return ok(got.rows.clone())
+
+	return error(Error("postgres: unreachable", kind: "EPROTO"))
 
 // Runs one statement on a pooled connection.
 fn var Pool.query(sql: String, params: List[Value] = []) Rows!:
