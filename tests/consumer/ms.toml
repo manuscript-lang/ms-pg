@@ -2,9 +2,3 @@
 name = "consumer"
 source = "src"
 entry = "src/main.ms"
-
-[dependencies]
-"@postgres" = "PACKAGE_URL"
-
-[effects]
-"@postgres" = "std.net.* std.clock.read std.random.read"
