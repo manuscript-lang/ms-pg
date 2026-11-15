@@ -3,7 +3,7 @@
 // rows travel back.
 import (
 	Placement, Promise, PromiseOptions, promise from "@std/concurrency/promise.ms",
-	Pipe, ReadStream, WriteStream, pipe from "@std/io/io.ms",
+	Pipe, ReadStream, Source, Ticket, WriteStream, pipe from "@std/io/io.ms",
 
 	Config, Conn, Rows, open from "@pg/conn.ms",
 	Value from "@pg/value.ms",
@@ -15,6 +15,9 @@ export type Statement:
 	params: List[Value] = []
 	// Send each row back as it arrives, then one closing reply (`Pool.each`).
 	stream: Bool = false
+	// Where to send them instead: a reply pipe the caller made for this statement
+	// (`Pool.stream`). The ticket is plain data, so it crosses the request pipe.
+	ticket: Ticket[Reply]? = none
 
 // One message from a worker: a whole result, a failure, or (streaming) one row. A
 // streamed statement ends with a reply that has no `row`: its `rows` hold the column
@@ -41,13 +44,35 @@ fn serve_streaming(var conn: Conn, request: Statement, var replies: WriteStream[
 
 	return replies.write(Reply(result?, none))
 
+// Runs a statement for `Pool.stream`: rows go to the caller's own reply pipe. A reader that
+// went away only stops the writes; the worker reads the rest of the result and goes on.
+fn serve_ticket(var conn: Conn, request: Statement, ticket: Ticket[Reply]) Void!:
+	opened := ticket.open()
+	if opened.is_error(): return ok()
+
+	var replies = opened?
+	void serve_streaming(var conn, request, var replies)
+	void replies.close()
+	return ok()
+
 // Answers every request with the connect failure.
 fn drain(
 	cause: Error,
 	var requests: ReadStream[Statement],
 	var replies: WriteStream[Reply],
 ) Void!:
-	for _request in requests: replies.write(failed(cause.clone()))?
+	for request in requests:
+		if t := request.ticket:
+			opened := t.open()
+			if opened.is_error(): continue
+
+			var own = opened?
+			void own.write(failed(cause.clone()))
+			void own.close()
+			continue
+
+		replies.write(failed(cause.clone()))?
+
 	return replies.close()
 
 // Runs requests on its own connection until the request stream ends.
@@ -57,6 +82,10 @@ fn serve(
 	var replies: WriteStream[Reply],
 ) Void!:
 	for request in requests:
+		if t := request.ticket:
+			serve_ticket(var conn, request, t)?
+			continue
+
 		if request.stream:
 			serve_streaming(var conn, request, var replies)?
 			continue
@@ -175,6 +204,35 @@ fn var Pool.each(sql: String, params: List[Value], each: fn(List[Value]) Void!) 
 		return ok(got.rows.clone())
 
 	return error(Error("postgres: unreachable", kind: "EPROTO"))
+
+type ReplySource:
+	replies: ReadStream[Reply]
+
+fn var ReplySource.next() List[Value]?!:
+	got := self.replies.next()?
+	if got.is_none(): return ok(none)
+
+	reply := got.get(failed(Error("postgres: no reply")))
+	if f := reply.failure: return error(f.clone())
+
+	return ok(reply.row)
+
+fn var ReplySource.close() Void!:
+	return self.replies.close()
+
+// Runs one statement on a pooled connection and returns its rows as a stream that composes
+// with `|`: `pool.stream(sql)? | filter(...) | map(...)`. The caller gets a pipe of its own
+// and the worker keeps its connection, so streams from different calls do not share a
+// reader. A server error is the stream's last item. Back pressure holds the worker, so read
+// the stream to its end or close it before asking the same worker for more, and close every
+// stream before `Pool.close`. `capacity` is how many rows may wait unread.
+fn var Pool.stream(sql: String, params: List[Value] = [], capacity: Int = 256) ReadStream[List[Value]]!:
+	var replies = pipe[Reply](capacity: capacity)
+	ticket := replies.ticket()?
+	index := self.next % self.slots.length()
+	self.next += 1
+	void self.slots[index].requests.write(Statement(sql.clone(), params.clone(), true, ticket))
+	return ok(ReadStream[List[Value]](ReplySource(replies.reader())))
 
 // Runs one statement on a pooled connection.
 fn var Pool.query(sql: String, params: List[Value] = []) Rows!:
