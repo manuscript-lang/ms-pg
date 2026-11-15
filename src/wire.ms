@@ -213,7 +213,7 @@ type CString:
 	next: Int
 
 fn bad(what: String) Error:
-	return Error("postgres: malformed {what}", kind: "EBADMSG")
+	return Error(f"postgres: malformed {what}", kind: "EBADMSG")
 
 fn read_cstring(data: Bytes, at: Int) CString!:
 	end := data.index_of_byte(0, at).ok_or(bad("string"))?
@@ -275,7 +275,7 @@ fn authentication(data: Bytes) Backend!:
 	if kind == 12: return ok(Backend.AuthSaslFinal(rest))
 	if kind != 10: return error(
 		Error(
-			"postgres: unsupported authentication method {kind}",
+			f"postgres: unsupported authentication method {kind}",
 			kind: "ENOTSUP",
 		)
 	)
@@ -327,4 +327,4 @@ export fn decode_message(code: UInt8, data: Bytes) Backend!:
 		for i in 0..count: oids.append(u32(data, 2 + 4 * i)?)
 		return ok(Backend.ParameterDescription(oids))
 
-	return error(Error("postgres: unexpected message type {code}", kind: "EPROTO"))
+	return error(Error(f"postgres: unexpected message type {code}", kind: "EPROTO"))

@@ -42,10 +42,10 @@ fn Value.as_text() String?:
 	match self:
 		Value.Null: return none
 		Value.Bool(value): return if value: "t" else: "f"
-		Value.Int(value): return "{value}"
-		Value.Float(value): return "{value}"
+		Value.Int(value): return f"{value}"
+		Value.Float(value): return f"{value}"
 		Value.Text(value): return value.clone()
-		Value.Bytes(value): return "\\x{hex_encode(value)}"
+		Value.Bytes(value): return f"\\x{hex_encode(value)}"
 		Value.Timestamp(value): return value.to_string()
 		Value.Date(days):
 			day := Timestamp(seconds: days * 86400, nanos: 0).to_string()
@@ -102,7 +102,7 @@ export fn encode_value(value: Value) Bytes?:
 
 fn bad(type_name: String, text: String) Error:
 	return Error(
-		"postgres: invalid {type_name} value from server: {text}",
+		f"postgres: invalid {type_name} value from server: {text}",
 		kind: "EBADMSG",
 	)
 
@@ -113,13 +113,13 @@ fn rfc3339(text: String) String:
 	if joined.length() < 11: return joined
 
 	sign := joined.slice(joined.length() - 3, joined.length() - 2).get("")
-	if sign == "+" or sign == "-": return "{joined}:00"
+	if sign == "+" or sign == "-": return f"{joined}:00"
 
 	longer := joined.slice(joined.length() - 6, joined.length() - 5).get("")
 	if longer == "+" or longer == "-": return joined
 	if joined.ends_with("Z"): return joined
 
-	return "{joined}Z"
+	return f"{joined}Z"
 
 fn decode_text_timestamp(text: String) Value!:
 	if text == "infinity" or text == "-infinity": return ok(Value.Text(text))
@@ -130,7 +130,7 @@ fn decode_text_timestamp(text: String) Value!:
 fn decode_text_date(text: String) Value!:
 	if text == "infinity" or text == "-infinity": return ok(Value.Text(text))
 
-	stamp := parse_timestamp("{text}T00:00:00Z").map_error(fn _e: bad("date", text))?
+	stamp := parse_timestamp(f"{text}T00:00:00Z").map_error(fn _e: bad("date", text))?
 	return ok(Value.Date(stamp.seconds / 86400))
 
 // Decodes a column sent in text format into the same `Value` the binary format gives.
@@ -193,7 +193,7 @@ export fn is_binary_type(type_oid: Int) Bool:
 
 fn size_error(type_name: String, size: Int) Error:
 	return Error(
-		"postgres: invalid binary {type_name} of {size} bytes from server",
+		f"postgres: invalid binary {type_name} of {size} bytes from server",
 		kind: "EBADMSG",
 	)
 
@@ -222,7 +222,7 @@ fn decode_uuid(bytes: Bytes) Value!:
 	c := hex_digits(bytes, 6, 8)?
 	d := hex_digits(bytes, 8, 10)?
 	e := hex_digits(bytes, 10, 16)?
-	return ok(Value.Text("{a}-{b}-{c}-{d}-{e}"))
+	return ok(Value.Text(f"{a}-{b}-{c}-{d}-{e}"))
 
 // Decodes one column from its binary form, by the column's type OID.
 fn decode_binary(type_oid: Int, bytes: Bytes) Value!:
