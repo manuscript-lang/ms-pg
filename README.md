@@ -9,8 +9,9 @@ extended query protocols (parse, bind and execute in one round trip), prepared s
 
 Prepared statements (`Conn.prepare` then `Conn.run`, or `Conn.query_cached`) ask for each result column in binary
 format when the client has a decoder for its type: `int2`, `int4`, `int8`, `oid`, `float4`, `float8`, `bool`, `bytea`,
-`text`, `varchar`, `uuid`, `date`, `timestamp`, `timestamptz`, `numeric`, `interval`, `json` and `jsonb`. Every other
-type stays text, chosen per column in the Bind message. Parameters of a prepared statement go out in binary for the
+`text`, `varchar`, `uuid`, `date`, `timestamp`, `timestamptz`, `numeric`, `interval`, `json`, `jsonb`, `time`, `timetz`,
+`inet`, `cidr`, `macaddr`, `bit`, `varbit`, the geometric types, ranges, multiranges, arrays of any of these, and types
+registered with `load_types`. Every other type stays text, chosen per column in the Bind message. Parameters of a prepared statement go out in binary for the
 types with an encoder (the statement's parameter types come from the server) and in text otherwise, and a value that
 does not fit (an `Int` over `int2` range) is sent as text so the server reports it. `Conn.query` (one round trip,
 columns unknown until it returns) stays text. Set `Config.binary_results` to false for text everywhere.
@@ -20,7 +21,7 @@ columns unknown until it returns) stays text. Set `Config.binary_results` to fal
 The format changes speed, never the type: `Conn.query`, `Conn.simple`, `Conn.run` and the pool all return the same
 `Value` variant for a column, in text or binary. A `timestamp` or `timestamptz` is `Value.Timestamp` (UTC; a `timestamp`
 without a zone is read as UTC), a `date` is `Value.Date` (days since 1970-01-01), a `uuid` is `Value.Text`, and
-`infinity` values are `Value.Text("infinity")` and `Value.Text("-infinity")`. A `numeric` is `Value.Decimal` (`NaN` and the infinities stay `Text`; a decimal drops trailing zeros), `json` and `jsonb` are `Value.Json(text)`, an `interval` is `Value.Interval(months, days, micros)`, and an array of a known element type is `Value.Array(items)`, nested for more dimensions (arrays read from the text format). A `float4` widens exactly to a `Float`, so
+`infinity` values are `Value.Text("infinity")` and `Value.Text("-infinity")`. A `numeric` is `Value.Decimal` (`NaN` and the infinities stay `Text`; a decimal drops trailing zeros), `json` and `jsonb` are `Value.Json(text)`, an `interval` is `Value.Interval(months, days, micros)`, and an array is `Value.Array(items)`, nested for more dimensions. Also: `Range(bounds, flags)` (a multirange is an `Array` of ranges), `Geometric(kind, numbers, closed)`, `Inet(address, bits)`, `Bits(length, data)`, `Time(micros)`, `TimeTz(micros, offset)`, and, for types registered with `load_types`, `Composite(fields)` and `Hstore(keys, values)`; an enum is `Text` and a domain is its base type. A `float4` widens exactly to a `Float`, so
 `0.1::float4` is 0.10000000149011612 in both formats. Read values with `value.int()`, `float()`, `bool()`, `text()`,
 `bytes()`, `timestamp()`, `date()`, `json()`, `decimal()`, `array()` (each `none` for another variant) and `is_null()`.
 
@@ -86,19 +87,25 @@ The names and behavior follow pgx where Manuscript's rules allow.
 - **Connection strings**: `parse_config` (`@pg/dsn.ms`) reads `postgres://user:pass@host:port/db?sslmode=verify-full` and `key=value` forms, with several hosts (`host=a,b port=1,2` or `postgres://a:1,b:2/db`) and `target_session_attrs`; `config_from_env(environment()?)` reads the `PG*` variables. Unknown keys become server settings in `Config.params`. `sslmode` is `disable` or `verify-full`; `prefer`, `allow` and `require` are refused, since each falls back to plaintext or skips certificate checks. Give a port list after the host list.
 - **Failover**: `open` tries `host`, then `Config.fallbacks`, and takes the first server that matches `target_session_attrs` (`any`, `read-write`, `read-only`, `primary`, `standby`, `prefer-standby`).
 - **Client certificates**: `TlsOptions(certificate_pem: ..., private_key_pem: ...)` in `Config.tls`.
+- **Password and service files**: `pgpass_password(text, host, port, database, user)` and `parse_service(text, name)` read the text of `.pgpass` and `pg_service.conf`; read the files with `@std/os/fs.ms`, since this package reads none.
+- **GSSAPI and SSPI**: `open_gss(config, token_function)` runs the exchange through a function you supply; Kerberos itself comes from your library, as in pgx.
+- **Replication**: `@pg/replication.ms` has `identify_system`, `create_logical_slot`, `create_physical_slot`, `drop_slot`, `start_replication`, `receive` (WAL data or a keepalive), `standby_status` and LSN parsing. Open the connection with `Config.replication` set to `database` (logical) or `true` (physical). Decoding a logical plugin's messages (`pgoutput`) is left to the caller.
+- **Server side of the protocol**: `@pg/server.ms` decodes client messages (`decode_frontend`) and encodes every server message, for test servers and proxies.
 - **Unix sockets**: a `host` that starts with `/` names the socket directory.
 - **Transactions**: `transaction_with(TxOptions(isolation: Isolation.Serializable, read_only: true), body)`, and `nested(name, body)` for a savepoint that rolls back alone.
 - **LISTEN/NOTIFY**: `listen`, `unlisten`, `notify` and `wait_for_notification`. Notifications that arrive during a statement are queued.
 - **Cancel**: `cancel(config, pid, secret)` from another task stops a running statement with SQLSTATE `57014`.
 - **Batch**: `Batch.add(sql, params)` then `conn.send_batch(batch)` sends every statement and one Sync in one round trip.
-- **COPY**: `conn.copy_from(["schema", "table"], columns, rows_stream)` takes a stream, so a pipeline feeds it; `conn.copy_to("copy (select ...) to stdout")` returns the lines. Both use the text format.
+- **COPY**: `conn.copy_from(["schema", "table"], columns, rows_stream)` takes a stream, so a pipeline feeds it, and `conn.copy_from_binary(...)` does the same in the binary format; `conn.copy_to("copy (select ...) to stdout")` returns the lines in text format.
+- **Named and simple statements**: `conn.query_named("select @id", args)`, and `conn.query_simple(sql, params)` substitutes the values on the client (pgx's simple protocol mode, for poolers).
+- **Named server types**: `conn.load_types(["mood", "pair", "hstore"])` teaches the connection enums, composites, domains, ranges and hstore.
 - **Statement cache**: `conn.query_cached(sql, params)` prepares each text once (`Config.statement_cache`, default 512), and `conn.deallocate(statement)` frees one.
 - **Tracing**: with `Config.trace`, `conn.take_trace()` returns a `TraceEvent` (kind, SQL, elapsed, failure kind) for each statement. Events are plain data rather than a callback, so they work across tasks.
 - **Large objects**: `@pg/large.ms` has `lo_create`, `lo_open`, `lo_read`, `lo_write`, `lo_seek`, `lo_tell`, `lo_truncate`, `lo_close` and `lo_unlink`; call them inside a transaction.
 - **Rows**: `rows.one()` (like `QueryRow`, with `ENOROWS` and `ETOOMANY`), `rows.column(name)`, `rows.maps()`.
 - **Connection**: `conn.ping()`, `conn.parameter(name)`, `conn.in_transaction()`, `quote_ident`.
 
-Not covered: scanning rows into user-defined structs (Manuscript has no reflection, so read `Value`s or use `rows.maps()`), geometric, range, hstore and composite types (they arrive as `Text`), binary COPY, replication, GSSAPI and a password file.
+Not covered: scanning rows into user-defined structs (Manuscript has no reflection, so read `Value`s or use `rows.maps()`), connect hooks such as `AfterConnect` (call your code after `open`), a `database/sql` adapter, and logging adapters (use `take_trace`). Logical replication and GSSAPI are tested against a fake server or physical replication only.
 
 ## Tests
 

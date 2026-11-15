@@ -8,12 +8,9 @@ import (
 	Duration, Instant, monotonic from "@std/time.ms",
 
 	md5_password, scram_start from "@pg/auth.ms",
-	Param,
-	Value,
-	decode_value,
-	encode_param,
-	encode_value,
-	is_binary_type from "@pg/value.ms",
+	Param, TypeInfo, decode_value, encode_param, is_binary_type from "@pg/decode.ms",
+	interpolate, named from "@pg/sql.ms",
+	Value, encode_value from "@pg/value.ms",
 	Backend,
 	Field,
 	PORTAL,
@@ -58,6 +55,9 @@ export type Config:
 	// TLS negotiated with an SSLRequest on the plain connection, then the same socket
 	// is upgraded; none is plain TCP.
 	tls: TlsOptions? = none
+	// Opens a replication connection: `database` for logical replication, `true` for
+	// physical. See `@pg/replication.ms`.
+	replication: String = ""
 	// Accept an md5 password challenge. Off by default: md5 is weak, and SCRAM-SHA-256
 	// is always accepted.
 	allow_md5: Bool = false
@@ -116,6 +116,8 @@ export type Conn:
 	// Statements `query_cached` parsed, by SQL text.
 	statements: Map[String, Prepared]
 	statement_cache: Int
+	// Types registered by `load_types`, by OID.
+	types: Map[Int, TypeInfo]
 	trace: Bool
 	events: List[TraceEvent]
 	// NOTIFY messages that arrived while a statement was running, oldest first.
@@ -278,9 +280,21 @@ fn var Conn.attrs_match(wanted: String) Bool!:
 	standby := recovery.rows[0][0].bool().get(false)
 	return ok(standby == (wanted == "standby" or wanted == "prefer-standby"))
 
+fn refuse_gss(_token: Bytes?) Bytes!:
+	return error(
+		Error("postgres: server asked for GSSAPI; use open_gss", kind: "EACCES")
+	)
+
+// Like `open` for a server that asks for GSSAPI or SSPI: `gss` is called with the
+// server's token (none at the start) and returns the token to send back, which may be
+// empty. Kerberos itself comes from the application's library, as in pgx. It opens
+// `host` only, with no failover.
+export fn open_gss(config: Config, gss: fn(Bytes?) Bytes!) Conn!:
+	return open_endpoint(config, gss)
+
 // Opens one server of `config` and checks it is the kind asked for.
 fn open_server(config: Config, wanted: String) Conn!:
-	var conn = open_endpoint(config)?
+	var conn = open_endpoint(config, refuse_gss)?
 	if conn.attrs_match(wanted)?: return ok(conn)
 
 	void conn.close()
@@ -320,7 +334,7 @@ export fn open(config: Config) Conn!:
 
 	return error(last)
 
-fn open_endpoint(config: Config) Conn!:
+fn open_endpoint(config: Config, gss: fn(Bytes?) Bytes!) Conn!:
 	var net = dial(config)?
 	var conn = Conn(
 		net,
@@ -333,17 +347,22 @@ fn open_endpoint(config: Config) Conn!:
 		config.binary_results,
 		Map[String, Prepared](),
 		config.statement_cache,
+		Map[Int, TypeInfo](),
 		config.trace,
 		[],
 		[],
 	)
 	var parameters = config.params.clone()
 	parameters.add("application_name", config.application_name.clone())
+	if not config.replication.is_empty(): parameters.add(
+		"replication",
+		config.replication.clone(),
+	)
 	conn.send(startup(config.user, config.database, parameters)?)?
-	conn.authenticate(config)?
+	conn.authenticate(config, gss)?
 	return ok(conn)
 
-fn var Conn.authenticate(config: Config) Void!:
+fn var Conn.authenticate(config: Config, gss: fn(Bytes?) Bytes!) Void!:
 	var scram = scram_start(config.password.clone())?
 	var in_scram = false
 	var server_verified = false
@@ -380,6 +399,11 @@ fn var Conn.authenticate(config: Config) Void!:
 						)
 					)
 				self.send(password(md5_password(config.user, config.password, salt))?)?
+			Backend.AuthGss:
+				self.send(sasl_response(gss(none)?)?)?
+			Backend.AuthGssContinue(data):
+				token := gss(data.clone())?
+				if token.length() > 0: self.send(sasl_response(token)?)?
 			Backend.AuthSasl(mechanisms):
 				if not mechanisms.contains("SCRAM-SHA-256"):
 					return error(protocol("server offers no SCRAM-SHA-256"))
@@ -444,6 +468,7 @@ fn var Conn.pump(known: List[Field], emit: fn(List[Value]) Void!) Rows!:
 						fields[i].type_oid,
 						fields[i].format,
 						columns[i].clone(),
+						self.types,
 					)
 
 					if decoded.is_error():
@@ -577,7 +602,7 @@ fn var Conn.prepare(name: String, sql: String) Prepared!:
 			fn c: Field(
 				c.name.clone(),
 				c.type_oid,
-				if is_binary_type(c.type_oid): 1 else: 0,
+				if is_binary_type(c.type_oid, self.types): 1 else: 0,
 			)
 		)
 	return ok(Prepared(name.clone(), columns, param_oids, sql.clone()))
@@ -810,6 +835,7 @@ fn var Conn.send_batch_untraced(batch: Batch) List[Rows]!:
 						fields[i].type_oid,
 						fields[i].format,
 						columns[i].clone(),
+						self.types,
 					)
 
 					if decoded.is_error():
@@ -856,21 +882,17 @@ fn copy_field(value: Value) String:
 fn copy_line(row: List[Value]) Bytes:
 	return f"{row.map(fn v: copy_field(v)).join("\t")}\n".to_bytes()
 
-// Loads rows into a table with `COPY ... FROM STDIN`, in the text format, and returns
-// how many the server stored. `table` is the table's name parts
-// (`["public", "items"]`); the names are quoted. Rows come from a stream, so a pipeline
-// feeds it:
-// `conn.copy_from(["items"], ["id", "name"], rows | map(...))`. Rows are sent in
-// batches of at most 64 KiB. When the stream fails, the COPY is aborted and nothing is
-// stored.
-fn var Conn.copy_from(
-	table: List[String],
-	columns: List[String],
-	rows: ReadStream[List[Value]],
+// Runs a `COPY ... FROM STDIN` statement: sends `head`, each row through `encode`, then
+// `tail`, in chunks of at most 64 KiB, and returns how many rows the server stored.
+// When the stream or `encode` fails, the COPY is aborted and nothing is stored.
+fn var Conn.copy_in(
+	statement: String,
+	encode: fn(List[Value]) Bytes!,
+	head: Bytes,
+	tail: Bytes,
+	rows: ReadStream[List[Value]]
 ) Int!:
-	target := table.map(fn t: quote_ident(t)).join(".")
-	names := if columns.is_empty(): "" else: f" ({columns.map(fn c: quote_ident(c)).join(", ")})"
-	self.send(query(f"COPY {target}{names} FROM STDIN")?)?
+	self.send(query(statement)?)?
 
 	var failure: Error? = none
 
@@ -879,8 +901,7 @@ fn var Conn.copy_from(
 
 		match message:
 			Backend.CopyInResponse: break
-			Backend.ErrorResponse(found):
-				failure = server_error(found)
+			Backend.ErrorResponse(found): failure = server_error(found)
 			Backend.ReadyForQuery(status):
 				self.status = status
 				if f := failure: return error(f)
@@ -889,7 +910,9 @@ fn var Conn.copy_from(
 			_: continue
 
 	var pending = BytesBuilder()
-	var size = 0
+	pending.append_bytes(head)
+
+	var size = head.length()
 	var source = rows
 	var cause: Error? = none
 
@@ -903,9 +926,15 @@ fn var Conn.copy_from(
 		item := next?
 		if item.is_none(): break
 
-		line := copy_line(item.get([]))
-		size += line.length()
-		pending.append_bytes(line)
+		line := encode(item.get([]))
+
+		if line.is_error():
+			cause = line.err().clone()
+			break
+
+		chunk := line?
+		size += chunk.length()
+		pending.append_bytes(chunk)
 
 		if size >= 65536:
 			self.send(copy_data(pending.drain())?)?
@@ -914,7 +943,8 @@ fn var Conn.copy_from(
 	if cause.is_some():
 		self.send(copy_fail("input failed")?)?
 	else:
-		if size > 0: self.send(copy_data(pending.drain())?)?
+		pending.append_bytes(tail)
+		self.send(copy_data(pending.drain())?)?
 		self.send(copy_done()?)?
 
 	var tag = ""
@@ -935,6 +965,90 @@ fn var Conn.copy_from(
 	if f := failure: return error(f)
 
 	return ok(Rows([], [], tag).affected().get(0))
+
+fn copy_target(table: List[String], columns: List[String]) String:
+	target := table.map(fn t: quote_ident(t)).join(".")
+	if columns.is_empty(): return target
+
+	return f"{target} ({columns.map(fn c: quote_ident(c)).join(", ")})"
+
+// Loads rows into a table with `COPY ... FROM STDIN`, in the text format, and returns
+// how many the server stored. `table` is the table's name parts
+// (`["public", "items"]`); the names are quoted. Rows come from a stream, so a pipeline
+// feeds it: `conn.copy_from(["items"], ["id", "name"], rows | map(...))`.
+fn var Conn.copy_from(
+	table: List[String],
+	columns: List[String],
+	rows: ReadStream[List[Value]],
+) Int!:
+	return self.copy_in(
+		f"COPY {copy_target(table, columns)} FROM STDIN",
+		fn row: ok(copy_line(row)),
+		Bytes([]),
+		Bytes([]),
+		rows
+	)
+
+// One row of binary COPY: a field count, then each field as a length and its bytes.
+fn binary_copy_row(oids: List[Int], row: List[Value]) Bytes!:
+	if row.length() != oids.length(): return error(
+		Error(
+			"postgres: COPY row has the wrong number of columns",
+			kind: "EINVAL",
+		)
+	)
+
+	var out = BytesBuilder()
+	out.append_int16_be(oids.length().to_int16().get(0))
+
+	for i in 0..oids.length():
+		param := encode_param(oids[i], row[i])
+
+		if data := param.data:
+			if param.format != 1: return error(
+				Error(
+					f"postgres: column {i} has no binary encoding for this value; use copy_from",
+					kind: "ENOTSUP",
+				)
+			)
+
+			out.append_int32_be(data.length().to_int32().get(0))
+			out.append_bytes(data)
+		else:
+			out.append_int32_be(-1)
+
+	return ok(out.build())
+
+// Like `copy_from`, in the binary format: faster and exact, but each value must have a
+// binary encoding for its column (integers, floats, bool, bytea, text, uuid, date and
+// timestamps). The column types come from the server, so the table must exist.
+fn var Conn.copy_from_binary(
+	table: List[String],
+	columns: List[String],
+	rows: ReadStream[List[Value]],
+) Int!:
+	names := if columns.is_empty(): "*" else: columns.map(
+		fn c: quote_ident(c)
+	).join(", ")
+	probe := self.prepare(
+		"",
+		f"select {names} from {table.map(fn t: quote_ident(t)).join(".")}",
+	)?
+	oids := probe.columns.map(fn c: c.type_oid)
+	var head = BytesBuilder()
+	head.append_bytes(Bytes([80, 71, 67, 79, 80, 89, 10, 255, 13, 10, 0]))
+	head.append_int32_be(0)
+	head.append_int32_be(0)
+
+	var tail = BytesBuilder()
+	tail.append_int16_be(-1)
+	return self.copy_in(
+		f"COPY {copy_target(table, columns)} FROM STDIN (FORMAT binary)",
+		fn row: binary_copy_row(oids, row),
+		head.build(),
+		tail.build(),
+		rows
+	)
 
 fn unescape_copy(text: String) Value:
 	if text == "\\N": return Value.Null
@@ -1080,3 +1194,56 @@ fn Rows.one() List[Value]!:
 	)
 
 	return ok(self.rows[0].clone())
+
+// Learns types the server defines by name, so their columns decode: enums (as `Text`),
+// composites (`Value.Composite`), domains (as their base type), ranges and multiranges
+// of any subtype, and `hstore`. Each name also registers its array type. List a
+// composite's field types too, or its fields stay text. Names are looked up as
+// `regtype` text, so schema-qualified names and quotes work.
+fn var Conn.load_types(names: List[String]) Void!:
+	sql := "select t.oid::int8, t.typtype::text, t.typbasetype::int8, t.typarray::int8, coalesce(r.rngsubtype, 0)::int8, coalesce(r.rngmultitypid, 0)::int8, coalesce((select array_agg(a.atttypid::int8 order by a.attnum) from pg_attribute a where a.attrelid = t.typrelid and a.attnum > 0 and not a.attisdropped), '{}'), t.typname from pg_type t left join pg_range r on r.rngtypid = t.oid where t.oid in (select to_regtype(n)::oid from unnest($1::text[]) n)"
+	rows := self.query(sql, [Value.Array(names.map(fn n: Value.Text(n.clone())))])?
+
+	for row in rows.rows:
+		oid := row[0].int().get(0)
+		kind := row[1].text().get("")
+		base := row[2].int().get(0)
+		array_oid := row[3].int().get(0)
+		subtype := row[4].int().get(0)
+		multi := row[5].int().get(0)
+		name := row[7].text().get("")
+		var fields = List[Int]()
+		for field in row[6].array().get([]): fields.append(field.int().get(0))
+
+		if kind == "e": self.types.add(oid, TypeInfo("enum"))
+		else if kind == "c": self.types.add(oid, TypeInfo("composite", 0, fields))
+		else if kind == "d": self.types.add(oid, TypeInfo("domain", base))
+		else if kind == "r": self.types.add(oid, TypeInfo("range", subtype))
+		else if name == "hstore": self.types.add(oid, TypeInfo("hstore"))
+
+		if multi > 0: self.types.add(multi, TypeInfo("multirange", subtype))
+		if array_oid > 0 and kind != "b" or array_oid > 0 and name == "hstore":
+			self.types.add(array_oid, TypeInfo("array", oid))
+
+	return ok()
+
+// Runs a statement with parameters over the simple protocol by substituting the values
+// into the text on the client (pgx's simple protocol mode), for poolers such as
+// PgBouncer in statement mode. Every result column is text-decoded.
+fn var Conn.query_simple(sql: String, params: List[Value]) Rows!:
+	return self.simple(interpolate(sql, params)?)
+
+// Runs a statement whose placeholders are `@name`, with values from `args`.
+fn var Conn.query_named(sql: String, args: Map[String, Value]) Rows!:
+	rewritten := named(sql, args)?
+	return self.query(rewritten.sql, rewritten.params)
+
+// The command's first word: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `COPY` and so on.
+fn Rows.verb() String:
+	return self.command.split(" ", none)[0].clone()
+
+// Frees every prepared statement on the server and forgets the cached ones.
+fn var Conn.deallocate_all() Void!:
+	void self.simple("DEALLOCATE ALL")?
+	self.statements.clear()
+	return ok()

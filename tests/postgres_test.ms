@@ -18,8 +18,9 @@ import (
 	Isolation,
 	TxOptions,
 	cancel,
-	open from "@pg/conn.ms",
-	config_from_env, parse_config from "@pg/dsn.ms",
+	open,
+	open_gss from "@pg/conn.ms",
+	config_from_env, parse_config, parse_service, pgpass_password from "@pg/dsn.ms",
 	LoMode,
 	Whence,
 	lo_close,
@@ -32,9 +33,43 @@ import (
 	lo_unlink,
 	lo_write from "@pg/large.ms",
 	Pool, PoolOptions, Statement, start, start_with from "@pg/pool.ms",
+	Message,
+	create_logical_slot,
+	create_physical_slot,
+	drop_slot,
+	format_lsn,
+	identify_system,
+	parse_lsn,
+	receive,
+	standby_status,
+	start_replication from "@pg/replication.ms",
+	Frontend,
+	auth_gss,
+	auth_gss_continue,
+	auth_ok,
+	backend_key_data,
+	command_complete,
+	data_row,
+	decode_frontend,
+	error_response,
+	notification,
+	parameter_description,
+	ready_for_query,
+	row_description from "@pg/server.ms",
+	interpolate, named from "@pg/sql.ms",
 	stream from "@pg/stream.ms",
 	Value from "@pg/value.ms",
-	Backend, DATA_ROW, decode_message from "@pg/wire.ms",
+	Backend,
+	DATA_ROW,
+	Field,
+	STATUS_IDLE,
+	bind,
+	decode_message,
+	describe,
+	execute,
+	parse,
+	query,
+	sync from "@pg/wire.ms",
 )
 
 // Connection settings come from PGHOST, PGPORT, PGUSER, PGPASSWORD and PGDATABASE.
@@ -897,3 +932,315 @@ test "a pool streams rows from a pooled connection":
 	broken := expect_error(pool.each("select 1/0", [], fn row: refuse(row)))?
 	expect_equal(broken.kind, "22012")?
 	pool.close()?
+
+fn text_conn() Conn!:
+	cfg := config()?
+	return open(
+		Config(
+			host: cfg.host.clone(),
+			port: cfg.port,
+			user: cfg.user.clone(),
+			password: cfg.password.clone(),
+			binary_results: false,
+		)
+	)
+
+test "ranges, geometry, network, bit and time types agree in both formats":
+	var binary = open(config()?)?
+	var text = text_conn()?
+	sql := "select '[1,5)'::int4range, '(,3]'::int4range, 'empty'::int4range, '{[1,3),[5,7)}'::int4multirange, '[2026-01-01,2026-02-01)'::daterange, '[1.5,2.5]'::numrange, '[1,3]'::int8range, '(1,2)'::point, '((0,0),(1,1))'::box, '[(0,0),(1,1)]'::path, '((0,0),(1,1))'::path, '((0,0),(1,0),(1,1))'::polygon, '{1,2,3}'::line, '<(1,2),3>'::circle, '[(0,0),(1,1)]'::lseg, '10.1.2.3'::inet, '10.0.0.0/8'::cidr, '::1'::inet, '2001:db8::1/64'::inet, '1010'::bit(4), '10101'::varbit, '12:34:56.789'::time, '12:34:56+05:30'::timetz, '08:00:2b:01:02:03'::macaddr, array['[1,3)'::int4range, '[5,7)']"
+	typed := first_row(var binary, sql)?
+	expect_equal(typed, first_row(var text, sql)?)?
+	expect_equal(typed[0], Value.Range([Value.Int(1), Value.Int(5)], 1))?
+	expect_equal(typed[1], Value.Range([Value.Null, Value.Int(4)], 0))?
+	expect_equal(typed[2], Value.Range([Value.Null, Value.Null], 4))?
+	expect_equal(typed[3].array().get([]).length(), 2)?
+	expect_equal(typed[7], Value.Geometric("point", [1.0, 2.0], false))?
+	expect_equal(typed[13], Value.Geometric("circle", [1.0, 2.0, 3.0], false))?
+	expect_equal(typed[15], Value.Inet("10.1.2.3", 32))?
+	expect_equal(typed[16], Value.Inet("10.0.0.0", 8))?
+	expect_equal(typed[17], Value.Inet("::1", 128))?
+	expect_equal(typed[18], Value.Inet("2001:db8::1", 64))?
+	expect_equal(typed[19], Value.Bits(4, Bytes([160])))?
+	expect_equal(typed[20], Value.Bits(5, Bytes([168])))?
+	expect_equal(typed[21], Value.Time(45296789000))?
+	expect_equal(typed[22], Value.TimeTz(45296000000, 19800))?
+	expect_equal(typed[23], Value.Text("08:00:2b:01:02:03"))?
+	binary.close()?
+	text.close()?
+
+test "ranges and geometry go out as parameters":
+	var conn = open(config()?)?
+	rows := conn.query(
+		"select $1::int4range, $2::point, $3::inet, $4::bit(3), $5::time",
+		[
+			Value.Range([Value.Int(1), Value.Int(9)], 1),
+			Value.Geometric("point", [1.5, -2.0], false),
+			Value.Inet("192.168.0.1", 24),
+			Value.Bits(3, Bytes([160])),
+			Value.Time(3723000000),
+		],
+	)?
+	expect_equal(rows.rows[0][0], Value.Range([Value.Int(1), Value.Int(9)], 1))?
+	expect_equal(rows.rows[0][1], Value.Geometric("point", [1.5, -2.0], false))?
+	expect_equal(rows.rows[0][2], Value.Inet("192.168.0.1", 24))?
+	expect_equal(rows.rows[0][3], Value.Bits(3, Bytes([160])))?
+	expect_equal(rows.rows[0][4], Value.Time(3723000000))?
+	conn.close()?
+
+test "enums, composites, domains, ranges and hstore load by name":
+	var conn = open(config()?)?
+	void conn.simple("create extension if not exists hstore")?
+	void conn.simple("drop type if exists pg_pair, pg_mood cascade")?
+	void conn.simple("drop domain if exists pg_posint")?
+	void conn.simple("drop type if exists pg_span cascade")?
+	void conn.simple("create type pg_mood as enum ('sad', 'ok')")?
+	void conn.simple("create type pg_pair as (n int4, note text, mood pg_mood)")?
+	void conn.simple("create domain pg_posint as int4 check (value > 0)")?
+	void conn.simple("create type pg_span as range (subtype = int4)")?
+	conn.load_types(["pg_mood", "pg_pair", "pg_posint", "pg_span", "hstore"])?
+
+	sql := "select 'ok'::pg_mood, row(1, 'a b', 'sad')::pg_pair, 5::pg_posint, '[1,4)'::pg_span, 'a=>1, b=>NULL'::hstore, array['sad', 'ok']::pg_mood[], array[row(2, null, 'ok')]::pg_pair[]"
+	var binary_conn = conn
+	typed := first_row(var binary_conn, sql)?
+	expect_equal(typed[0], Value.Text("ok"))?
+	expect_equal(
+		typed[1],
+		Value.Composite([Value.Int(1), Value.Text("a b"), Value.Text("sad")]),
+	)?
+	expect_equal(typed[2], Value.Int(5))?
+	expect_equal(typed[3], Value.Range([Value.Int(1), Value.Int(4)], 1))?
+	expect_equal(typed[4], Value.Hstore(["a", "b"], [Value.Text("1"), Value.Null]))?
+	expect_equal(typed[5], Value.Array([Value.Text("sad"), Value.Text("ok")]))?
+	expect_equal(
+		typed[6],
+		Value.Array(
+			[Value.Composite([Value.Int(2), Value.Null, Value.Text("ok")])]
+		),
+	)?
+
+	queried := binary_conn.query(sql, [])?
+	expect_equal(queried.rows[0], typed)?
+	void binary_conn.simple("drop type pg_pair, pg_mood, pg_span cascade")?
+	void binary_conn.simple("drop domain pg_posint")?
+	binary_conn.close()?
+
+test "named arguments and simple protocol substitution skip quoted text":
+	var args = Map[String, Value]()
+	args.add("id", Value.Int(7))
+	args.add("name", Value.Text("o'brien"))
+
+	rewritten := named("select @id, '@id', @name, @id -- @id\n, @@x", args)?
+	expect_equal(rewritten.sql, "select $1, '@id', $2, $1 -- @id\n, @x")?
+	expect_equal(rewritten.params.length(), 2)?
+	void expect_error(named("select @missing", args))?
+
+	text := interpolate(
+		"select $1, '$1', $2, $3, $4",
+		[Value.Int(1), Value.Text("it's"), Value.Null, Value.Bool(true)],
+	)?
+	expect_equal(text, "select 1, '$1', 'it''s', NULL, true")?
+	void expect_error(interpolate("select $2", [Value.Int(1)]))?
+
+test "named, simple and binary COPY paths agree with the extended protocol":
+	var conn = open(config()?)?
+	var args = Map[String, Value]()
+	args.add("n", Value.Int(41))
+
+	named_rows := conn.query_named("select @n::int8 + 1", args)?
+	expect_equal(named_rows.rows[0][0], Value.Int(42))?
+
+	simple_rows := conn.query_simple(
+		"select $1::int8 + 1, $2::text",
+		[Value.Int(41), Value.Text("a'b")],
+	)?
+	expect_equal(simple_rows.rows[0][1], Value.Text("a'b"))?
+	expect_equal(simple_rows.verb(), "SELECT")?
+	void conn.simple(
+		"create temp table bc (id int8, note text, at timestamptz, raw bytea, ok bool)"
+	)?
+
+	stamp := Timestamp(seconds: 1700000000, nanos: 0)
+	rows := [
+		[
+			Value.Int(1),
+			Value.Text("a"),
+			Value.Timestamp(stamp.clone()),
+			Value.Bytes(Bytes([0, 1])),
+			Value.Bool(true),
+		],
+		[Value.Int(2), Value.Null, Value.Null, Value.Null, Value.Bool(false)],
+	]
+	stored := conn.copy_from_binary(["bc"], [], from_list(rows))?
+	expect_equal(stored, 2)?
+
+	back := conn.query("select id, note, at, raw, ok from bc order by id", [])?
+	expect_equal(back.rows[0][2], Value.Timestamp(stamp))?
+	expect_equal(back.rows[1][1], Value.Null)?
+	void expect_error(
+		conn.copy_from_binary(["bc"], ["id"], from_list([[Value.Text("x")]]))
+	)?
+	conn.close()?
+
+test "a password file matches the first line, with wildcards and escapes":
+	text := "# comment\nother:5432:*:*:no\nlocalhost:*:shop:app:s\\:ecret\\\\\n*:*:*:*:fallback\n"
+	expect_equal(pgpass_password(text, "localhost", 5433, "shop", "app"), "s:ecret\\")?
+	expect_equal(pgpass_password(text, "db", 5432, "x", "y"), "fallback")?
+	expect_true(pgpass_password("db:1:*:*:pw", "db", 2, "x", "y").is_none())?
+
+test "a service file section sets the connection":
+	text := "[prod]\nhost=db.example\nport=6543\ndbname=shop\nuser=app\n[dev]\nhost=localhost\n"
+	service := parse_service(text, "prod")?
+	expect_equal(service.host, "db.example")?
+	expect_equal(service.port, 6543)?
+	expect_equal(service.database, "shop")?
+	void expect_error(parse_service(text, "missing"))?
+
+fn unframe(message: Bytes) Backend!:
+	return decode_message(message.get(0), message.slice(5, message.length())?)
+
+test "server messages decode as the client reads them":
+	match unframe(row_description([Field("n", 23, 0), Field("t", 25, 1)])?)?:
+		Backend.RowDescription(fields):
+			expect_equal(fields.length(), 2)?
+			expect_equal(fields[1].type_oid, 25)?
+			expect_equal(fields[1].format, 1)?
+		_: expect_true(false)?
+
+	match unframe(data_row([Bytes([49]), none])?)?:
+		Backend.DataRow(columns):
+			expect_true(columns[1].is_none())?
+			expect_equal(columns[0], Bytes([49]))?
+		_: expect_true(false)?
+
+	var fields = Map[String, String]()
+	fields.add("C", "22012")
+	fields.add("M", "division by zero")
+
+	match unframe(error_response(fields)?)?:
+		Backend.ErrorResponse(found): expect_equal(found.get_or("C", ""), "22012")?
+		_: expect_true(false)?
+
+	match unframe(notification(7, "jobs", "go")?)?:
+		Backend.Notification(pid, channel, payload):
+			expect_equal(pid, 7)?
+			expect_equal(channel, "jobs")?
+			expect_equal(payload, "go")?
+		_: expect_true(false)?
+
+	match unframe(command_complete("SELECT 1")?)?:
+		Backend.CommandComplete(tag): expect_equal(tag, "SELECT 1")?
+		_: expect_true(false)?
+
+	match unframe(parameter_description([23, 25])?)?:
+		Backend.ParameterDescription(oids): expect_equal(oids, [23, 25])?
+		_: expect_true(false)?
+
+fn unframe_client(message: Bytes) Frontend!:
+	return decode_frontend(message.get(0), message.slice(5, message.length())?)
+
+test "client messages decode as a server reads them":
+	match unframe_client(query("select 1")?)?:
+		Frontend.Query(sql): expect_equal(sql, "select 1")?
+		_: expect_true(false)?
+
+	match unframe_client(parse("s1", "select $1", [23])?)?:
+		Frontend.Parse(name, sql, oids):
+			expect_equal(name, "s1")?
+			expect_equal(sql, "select $1")?
+			expect_equal(oids, [23])?
+		_: expect_true(false)?
+
+	match unframe_client(bind("p", "s1", [Bytes([55]), none], [0, 1], [1])?)?:
+		Frontend.Bind(portal, statement, params, formats, results):
+			expect_equal(portal, "p")?
+			expect_equal(statement, "s1")?
+			expect_equal(params.length(), 2)?
+			expect_true(params[1].is_none())?
+			expect_equal(formats, [0, 1])?
+			expect_equal(results, [1])?
+		_: expect_true(false)?
+
+	match unframe_client(execute("p", 5)?)?:
+		Frontend.Execute(portal, rows):
+			expect_equal(portal, "p")?
+			expect_equal(rows, 5)?
+		_: expect_true(false)?
+
+	match unframe_client(sync()?)?:
+		Frontend.Sync: expect_true(true)?
+		_: expect_true(false)?
+
+fn gss_server(accepted: Promise[Connection]) Void!:
+	var client = accepted.wait()?
+	void client.input.next()?
+	client.output.write(auth_gss()?)?
+
+	first := client.input.next()?
+	expect_equal(first.get(Bytes([])).slice(5, 8)?, Bytes([1, 2, 3]))?
+	client.output.write(auth_gss_continue(Bytes([9]))?)?
+
+	second := client.input.next()?
+	expect_equal(second.get(Bytes([])).slice(5, 6)?, Bytes([7]))?
+	client.output.write(auth_ok()?)?
+	client.output.write(backend_key_data(1, 2)?)?
+	client.output.write(ready_for_query(STATUS_IDLE)?)?
+	return client.close()
+
+fn gss_step(token: Bytes?) Bytes!:
+	if token.is_none(): return ok(Bytes([1, 2, 3]))
+	return ok(Bytes([7]))
+
+test "a GSSAPI exchange runs through the supplied function":
+	var listener = listen("127.0.0.1:0")?
+	accepted := listener.accept()
+	port := listener.address().split(":")[1].parse_int().ok_or(Error("bad address"))?
+	serving := promise(fn: gss_server(accepted))
+	var conn = open_gss(Config(port: port), gss_step)?
+	expect_equal(conn.pid, 1)?
+	serving.wait()?
+	void expect_error(open(Config(port: port)))
+	listener.close()?
+
+fn replication_config() Config!:
+	var settings = config()?
+	settings.replication = "true"
+	return ok(settings)
+
+test "physical replication streams WAL and keepalives":
+	var conn = open(replication_config()?)?
+	info := identify_system(var conn)?
+	expect_true(info.position > 0)?
+	expect_equal(parse_lsn(format_lsn(info.position))?, info.position)?
+
+	slot := create_physical_slot(var conn, "ms_pg_slot", true)?
+	start_replication(var conn, slot.name, info.position, false, [])?
+
+	var writer = open(config()?)?
+	void writer.simple("create table if not exists wal_probe (n int)")?
+	void writer.simple("insert into wal_probe values (1)")?
+
+	var got = false
+
+	for _n in 0..20:
+		message := receive(var conn)?
+
+		match message:
+			Message.XLog(wal):
+				expect_true(wal.data.length() > 0)?
+				got = true
+			Message.Keepalive(beat): standby_status(
+				var conn,
+				beat.end,
+				beat.end,
+				beat.end,
+				0,
+				false,
+			)?
+
+		if got: break
+
+	expect_true(got)?
+	void writer.simple("drop table wal_probe")?
+	writer.close()?
+	conn.close()?
