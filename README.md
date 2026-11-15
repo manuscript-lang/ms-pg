@@ -40,7 +40,7 @@ fn main() Void!:
     rows := conn.query("select $1::int8 + 1", [Value.Int(41)])?
     print("{rows.rows[0][0]}")
     conn.close()?
-    return ok(unit)
+    return ok()
 ```
 
 `Pool` (`@pg/pool.ms`) runs statements on worker tasks that each own one connection. A connection cannot move
@@ -54,15 +54,22 @@ and on dispatch on Linux, macOS and Windows, with a `ms` built from the `manuscr
 
 ## As a dependency
 
-This repository is a Manuscript package: its root holds `ms.toml` and `src/`. Name it under `[dependencies]` with a tag
-or a full commit, allow the effects it declares under `[effects]`, and run `ms fetch`, which pins it in `ms.lock`:
+This repository is a Manuscript package: its root holds `ms.toml` and `src/`. Add it to a project with `ms add`, which
+installs it, pins it in `ms.lock`, and with `--allow` accepts the effects it declares (`std.net.*`, `std.clock.read`,
+`std.random.read`):
+
+```sh
+ms add https://github.com/manuscript-lang/ms-pg.git --sha <40-character commit> --allow
+```
+
+This writes the following to `ms.toml`; import with `import Config, open from "@pg/conn.ms"`.
 
 ```toml
 [dependencies]
-"@pg" = "https://github.com/manuscript-lang/ms-pg.git#<tag or 40-character commit>"
+"@pg" = { url = "https://github.com/manuscript-lang/ms-pg.git", sha = "<40-character commit>" }
 
 [effects]
-"@pg" = "std.net.* std.clock.read std.random.read"
+"@pg" = ["std.net.*", "std.clock.read", "std.random.read"]
 ```
 
 Import with `import Config, open from "@pg/conn.ms"`. `tests/consumer/run.sh` does this against a local git repository and runs a query.

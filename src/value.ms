@@ -114,7 +114,7 @@ fn size_error(type_name: String, size: Int) Error:
 
 fn expect_size(type_name: String, bytes: Bytes, size: Int) Void!:
 	if bytes.length() != size: return error(size_error(type_name, bytes.length()))
-	return ok(unit)
+	return ok()
 
 // Microseconds since 2000-01-01 as a timestamp. The infinities PostgreSQL stores as the
 // extreme integers read as the text the server sends for them.
