@@ -21,15 +21,21 @@ export enum Mode:
 	Single
 	Transaction
 	Pipelined
+	// One statement whose rows come back one by one (`Pool.each`).
+	Streaming
 
 // The work sent to a worker.
 export type Job:
 	statements: List[Statement]
 	mode: Mode
 
+// One message from a worker: results, a failure, or (streaming) one row. A streamed
+// statement ends with a reply that has no `row`: its result holds the column names and
+// command tag only, or `failure` is set.
 export type Reply:
 	results: List[Rows]
 	failure: Error?
+	row: List[Value]? = none
 
 fn failed(cause: Error) Reply:
 	return Reply([], cause)
@@ -58,6 +64,21 @@ fn drain(cause: Error, var jobs: ReadStream[Job], var replies: WriteStream[Reply
 fn connection_failed(cause: Error) Bool:
 	kind := cause.kind.get("")
 	return kind.length() != 5 or kind.starts_with("08") or kind.starts_with("57P")
+
+fn send_row(var replies: WriteStream[Reply], row: List[Value]) Void!:
+	return replies.write(Reply([], none, row))
+
+// Runs one streamed statement, writing a reply per row and a closing reply.
+fn serve_streaming(var conn: Conn, job: Job, var replies: WriteStream[Reply]) Void!:
+	statement := job.statements[0]
+	result := conn.run_streaming(
+		statement.sql,
+		statement.params,
+		fn row: send_row(var replies, row)
+	)
+	if result.is_error(): return replies.write(failed(result.err().clone()))
+
+	return replies.write(Reply([result?], none))
 
 fn run_job(var conn: Conn, job: Job) List[Rows]!:
 	if job.mode == Mode.Pipelined:
@@ -109,6 +130,12 @@ fn serve(
 			conn = opened?
 			stale = false
 			born = lifetime_deadline(settings.max_lifetime.clone())
+
+		if job.mode == Mode.Streaming:
+			streamed := serve_streaming(var conn, job, var replies)
+			idle = lifetime_deadline(settings.max_idle.clone())
+			if streamed.is_error(): stale = true
+			continue
 
 		result := run_job(var conn, job)
 		idle = lifetime_deadline(settings.max_idle.clone())
@@ -213,6 +240,39 @@ fn var Pool.take(index: Int) List[Rows]!:
 	if f := got.failure: return error(f.clone())
 
 	return ok(got.results.clone())
+
+fn var Pool.reply(index: Int) Reply!:
+	reply := self.slots[index].replies.next()?
+	if reply.is_none(): return error(
+		Error("postgres: pool worker stopped", kind: "ECONNRESET")
+	)
+
+	return ok(reply.get(failed(Error("postgres: no reply"))))
+
+// Runs one statement on a pooled connection and hands each row to `each` as the server
+// sends it, so a large result never sits in memory. The result holds the column names
+// and command tag, with no rows. If `each` fails, the rest of the result is read and
+// dropped so the worker stays in step, and the first error is returned.
+fn var Pool.each(sql: String, params: List[Value], each: fn(List[Value]) Void!) Rows!:
+	index := self.submit(Job([Statement(sql.clone(), params.clone())], Mode.Streaming))?
+	var failure: Error? = none
+
+	while true:
+		got := self.reply(index)?
+
+		if row := got.row:
+			if failure.is_none():
+				handled := each(row)
+				if handled.is_error(): failure = handled.err().clone()
+
+			continue
+
+		if f := failure: return error(f)
+		if f := got.failure: return error(f.clone())
+
+		return ok(got.results[0].clone())
+
+	return error(Error("postgres: unreachable", kind: "EPROTO"))
 
 fn var Pool.run_one(job: Job) List[Rows]!:
 	index := self.submit(job)?
