@@ -274,13 +274,13 @@ fn var Conn.authenticate(config: Config) Void!:
 
 	return ok()
 
-// Reads messages up to ReadyForQuery, collecting rows. A server error or a value that
-// cannot be decoded is remembered, and the first one is returned once the server has
-// finished, so the connection stays usable. A failed read ends the connection and
-// returns at once.
-fn var Conn.collect(known: List[Field]) Rows!:
+// Reads messages up to ReadyForQuery, handing each decoded row to `emit` as it arrives.
+// A server error or a value that cannot be decoded is remembered, and the first one is
+// returned once the server has finished, so the connection stays usable. A failed read
+// or a failed `emit` ends the connection's use and returns at once. The result holds
+// the column names and command tag, with no rows.
+fn var Conn.pump(known: List[Field], emit: fn(List[Value]) Void!) Rows!:
 	var fields = known.clone()
-	var rows = List[List[Value]]()
 	var command = ""
 	var failure: Error? = none
 
@@ -310,7 +310,8 @@ fn var Conn.collect(known: List[Field]) Rows!:
 						break
 
 					row.append(decoded?)
-				rows.append(row)
+
+				if failure.is_none(): emit(row)?
 			Backend.CommandComplete(tag): command = tag.clone()
 			Backend.ErrorResponse(found):
 				if failure.is_none(): failure = server_error(found)
@@ -321,13 +322,39 @@ fn var Conn.collect(known: List[Field]) Rows!:
 
 	if f := failure: return error(f)
 
-	return ok(Rows(fields.map(fn f: f.name.clone()), rows, command))
+	return ok(Rows(fields.map(fn f: f.name.clone()), [], command))
+
+fn append_row(var rows: List[List[Value]], row: List[Value]) Void!:
+	rows.append(row)
+	return ok()
+
+// Reads one statement's reply into memory.
+fn var Conn.collect(known: List[Field]) Rows!:
+	var rows = List[List[Value]]()
+	header := self.pump(known, fn row: append_row(var rows, row))?
+	return ok(Rows(header.columns.clone(), rows, header.command.clone()))
 
 // Runs a statement with no parameters over the simple protocol; may hold several
 // statements.
 fn var Conn.simple(sql: String) Rows!:
 	self.send(query(sql)?)?
 	return self.collect([])
+
+// Runs one statement with parameters in a single round trip, handing each row to `emit`
+// as it arrives instead of collecting them.
+fn var Conn.run_streaming(
+	sql: String,
+	params: List[Value],
+	emit: fn(List[Value]) Void!
+) Rows!:
+	var out = BytesBuilder()
+	out.append_bytes(parse("", sql, [])?)
+	out.append_bytes(bind("", "", params.map(fn p: encode_value(p)), [])?)
+	out.append_bytes(describe(PORTAL, "")?)
+	out.append_bytes(execute("", 0)?)
+	out.append_bytes(sync()?)
+	self.send(out.build())?
+	return self.pump([], emit)
 
 // Runs one statement with parameters in a single round trip.
 fn var Conn.query(sql: String, params: List[Value]) Rows!:

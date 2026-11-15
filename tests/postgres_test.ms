@@ -1,7 +1,7 @@
 import (
 	Bytes from "@std/bytes.ms",
 	Promise, promise from "@std/concurrency/promise.ms",
-	collect, filter, fold, map from "@std/io/streams.ms",
+	collect, filter, fold, map, take from "@std/io/streams.ms",
 	Connection, listen from "@std/net/net.ms",
 	TlsOptions from "@std/net/tls.ms",
 	environment from "@std/os/env.ms",
@@ -12,6 +12,7 @@ import (
 	md5_password from "@pg/auth.ms",
 	Config, Conn, open from "@pg/conn.ms",
 	Pool, Statement, start from "@pg/pool.ms",
+	stream from "@pg/stream.ms",
 	Value from "@pg/value.ms",
 	Backend, DATA_ROW, decode_message from "@pg/wire.ms",
 )
@@ -378,3 +379,33 @@ test "rows compose with stream pipelines":
 	)?
 	expect_equal(total, 110)?
 	conn.close()?
+
+test "stream sends rows as the server produces them":
+	// 100000 rows through a 16-row pipe: the stream never holds them all.
+	total := fold(
+		stream(
+			config()?,
+			"select n from generate_series(1, 100000) n",
+			[],
+			16,
+		) | map(fn row: (row[0].int().get(0))),
+		0,
+		fn sum,
+		n: sum + n
+	)?
+	expect_equal(total, 5000050000)?
+
+	first := collect(
+		stream(
+			config()?,
+			"select n from generate_series(1, 100000) n",
+			[],
+			16,
+		) | take(3),
+		max_items: 10,
+	)?
+	expect_equal(first.length(), 3)?
+
+test "a stream ends with the server error":
+	failure := expect_error(collect(stream(config()?, "select 1/0", []), max_items: 10))?
+	expect_equal(failure.kind, "22012")?

@@ -24,14 +24,21 @@ without a zone is read as UTC), a `date` is `Value.Date` (days since 1970-01-01)
 
 ## Pipelines
 
-`rows.stream()` is a `ReadStream`, so a result composes with the standard stream steps:
+Two ways to get rows as a `ReadStream`, so they compose with the standard stream steps:
 
 ```manuscript
-big := rows.stream() | filter(fn row: row[0].int().get(0) > 100) | map(fn row: row[1].text().get(""))
+import stream from "@pg/stream.ms"
+import collect, filter, map from "@std/io/streams.ms"
+
+// Rows as the server sends them, on their own connection; a slow reader slows the server.
+big := stream(config, "select id, name from items") | filter(fn row: row[0].int().get(0) > 100) | map(fn row: row[1].text().get(""))
 names := collect(big, max_items: 1000)?
+
+// Or the rows of a result you already fetched with `conn.query`:
+evens := collect(rows.stream() | filter(fn row: row[0].int().get(0) % 2 == 0), max_items: 100)?
 ```
 
-The stream owns a copy of an already-fetched result; the connection cannot yet stream rows as the server sends them (issue #9).
+`stream` runs the query in a task with its own connection (a task cannot borrow yours), so each stream pays one login. A server or login error is the stream's last item; closing the stream early (`take`, `break`) stops the query.
 
 ## Logins
 
