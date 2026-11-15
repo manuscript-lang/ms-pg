@@ -1,6 +1,7 @@
 import (
 	Bytes from "@std/bytes.ms",
 	Promise, promise from "@std/concurrency/promise.ms",
+	collect, filter, fold, map, take from "@std/io/streams.ms",
 	Connection, listen from "@std/net/net.ms",
 	TlsOptions from "@std/net/tls.ms",
 	environment from "@std/os/env.ms",
@@ -11,6 +12,7 @@ import (
 	md5_password from "@pg/auth.ms",
 	Config, Conn, open from "@pg/conn.ms",
 	Pool, Statement, start from "@pg/pool.ms",
+	stream from "@pg/stream.ms",
 	Value from "@pg/value.ms",
 	Backend, DATA_ROW, decode_message from "@pg/wire.ms",
 )
@@ -88,17 +90,15 @@ test "a prepared statement runs repeatedly with typed results":
 
 test "transactions commit and roll back":
 	var conn = open(config()?)?
-	_ := conn.simple("create temp table t (n int)")?
+	void conn.simple("create temp table t (n int)")?
 	conn.begin()?
-
-	_ := conn.query("insert into t values ($1)", [Value.Int(1)])?
+	void conn.query("insert into t values ($1)", [Value.Int(1)])?
 	conn.rollback()?
 
 	none_left := conn.query("select count(*) from t", [])?
 	expect_equal(none_left.rows[0][0], Value.Int(0))?
 	conn.begin()?
-
-	_ := conn.query("insert into t values ($1)", [Value.Int(1)])?
+	void conn.query("insert into t values ($1)", [Value.Int(1)])?
 	conn.commit()?
 
 	one_left := conn.query("select count(*) from t", [])?
@@ -173,7 +173,7 @@ fn impostor_accept(accepted: Promise[Connection]) Void!:
 // A server that offers SCRAM and then says "authenticated" without ever proving it
 // knows the password.
 fn impostor(var client: Connection) Void!:
-	_ := client.input.next()?
+	void client.input.next()?
 
 	// R, length 23, method 10, "SCRAM-SHA-256", two NULs
 	offer := Bytes(
@@ -183,11 +183,10 @@ fn impostor(var client: Connection) Void!:
 		]
 	)
 	client.output.write(offer)?
-
-	_ := client.input.next()?
+	void client.input.next()?
 	client.output.write(Bytes([82, 0, 0, 0, 8, 0, 0, 0, 0]))?
 	client.close()?
-	return ok(unit)
+	return ok()
 
 test "a server that skips the SCRAM proof is rejected":
 	var listener = listen("127.0.0.1:0")?
@@ -201,17 +200,18 @@ test "a server that skips the SCRAM proof is rejected":
 
 test "transaction commits on success and rolls back on error":
 	var conn = open(config()?)?
-	_ := conn.simple("create temp table tx (n int)")?
+	void conn.simple("create temp table tx (n int)")?
+
 	added := conn.transaction(
 		fn(var c: Conn): c.query("insert into tx values (1)", [])
 	)?
 	expect_equal(added.command, "INSERT 0 1")?
-
-	_ := expect_error(
+	void expect_error(
 		conn.transaction(
 			fn(var c: Conn): c.query("insert into tx values (1/0)", [])
 		)
 	)?
+
 	count := conn.query("select count(*) from tx", [])?
 	expect_equal(count.rows[0][0], Value.Int(1))?
 	conn.close()?
@@ -237,10 +237,10 @@ test "TLS login upgrades the socket after an SSLRequest":
 
 // A server that answers the SSL request with `N`: no TLS here.
 fn refuser(var client: Connection) Void!:
-	_ := client.input.next()?
+	void client.input.next()?
 	client.output.write(Bytes([78]))?
 	client.close()?
-	return ok(unit)
+	return ok()
 
 fn refuser_accept(accepted: Promise[Connection]) Void!:
 	var client = accepted.wait()?
@@ -311,10 +311,101 @@ test "binary and text results agree, and numeric stays text":
 			binary_results: false,
 		)
 	)?
-	sql := "select 7::int4, 0.1::float8, 'x'::text, 1.25::numeric, 'e'::bytea"
+	sql := "select 7::int4, 0.1::float8, 'x'::text, 1.25::numeric, 'e'::bytea, 0.1::float4, 16777217::float4, '2026-11-15 12:34:56.789012+05:30'::timestamptz, '1969-12-31 23:59:59.5'::timestamp, '2000-03-01'::date, 'infinity'::timestamptz, '123e4567-e89b-12d3-a456-426614174000'::uuid"
 	expect_equal(first_row(var binary, sql)?, first_row(var text, sql)?)?
 
 	row := first_row(var binary, sql)?
 	expect_equal(row[3], Value.Text("1.25"))?
+
+	// NaN never equals itself, so compare it by `is_nan` in both formats.
+	nan := "select 'NaN'::float8, 'Infinity'::float8"
+
+	for pair in [first_row(var binary, nan)?, first_row(var text, nan)?]:
+		expect_equal(pair[0].float().get(0.0).is_nan(), true)?
+		expect_equal(pair[1].float().get(0.0).is_finite(), false)?
+
 	binary.close()?
 	text.close()?
+
+test "every call path returns the same typed values":
+	var conn = open(config()?)?
+	sql := "select 0.1::float4, '2026-11-15 12:34:56.789012+05:30'::timestamptz, '2000-03-01'::date, 12::int8, null::text"
+	typed := first_row(var conn, sql)?
+
+	// The one-round-trip path and the simple protocol return text-format columns.
+	queried := conn.query(sql, [])?
+	expect_equal(queried.rows[0], typed)?
+
+	simple := conn.simple(sql)?
+	expect_equal(simple.rows[0], typed)?
+
+	// A float4 widens exactly, so 0.1::float4 is not the double 0.1, in either format.
+	expect_equal(typed[0].float(), 0.10000000149011612)?
+	expect_equal(typed[1].timestamp().is_some(), true)?
+	expect_equal(typed[2].date(), 11017)?
+	expect_equal(typed[3].int(), 12)?
+	expect_equal(typed[4].is_null(), true)?
+	expect_equal(typed[3].text(), none)?
+	conn.close()?
+
+test "a pool with no workers is an error":
+	failure := expect_error(start(config()?, 0))?
+	expect_equal(failure.kind, "EINVAL")?
+
+test "a pool runs more statements than its pipes hold":
+	var pool = start(config()?, 2)?
+	statements := (0..400).map(fn n: Statement("select $1::int", [Value.Int(n)]))
+	results := pool.query_all(statements)?
+	expect_equal(results.length(), 400)?
+	for n in 0..400: expect_equal(results[n].rows[0][0], Value.Int(n))?
+	pool.close()?
+
+test "rows compose with stream pipelines":
+	var conn = open(config()?)?
+	rows := conn.query("select n, n * 2 from generate_series(1, 10) n", [])?
+	evens := collect(
+		rows.stream() | filter(fn row: row[0].int().get(0) % 2 == 0) | map(
+			fn row: (row[1].int().get(0))
+		),
+		max_items: 10,
+	)?
+	expect_equal(evens, [4, 8, 12, 16, 20])?
+
+	total := fold(
+		rows.stream() | map(fn row: row[1].int().get(0)),
+		0,
+		fn sum,
+		n: (sum + n)
+	)?
+	expect_equal(total, 110)?
+	conn.close()?
+
+test "stream sends rows as the server produces them":
+	// 100000 rows through a 16-row pipe: the stream never holds them all.
+	total := fold(
+		stream(
+			config()?,
+			"select n from generate_series(1, 100000) n",
+			[],
+			16,
+		) | map(fn row: (row[0].int().get(0))),
+		0,
+		fn sum,
+		n: sum + n
+	)?
+	expect_equal(total, 5000050000)?
+
+	first := collect(
+		stream(
+			config()?,
+			"select n from generate_series(1, 100000) n",
+			[],
+			16,
+		) | take(3),
+		max_items: 10,
+	)?
+	expect_equal(first.length(), 3)?
+
+test "a stream ends with the server error":
+	failure := expect_error(collect(stream(config()?, "select 1/0", []), max_items: 10))?
+	expect_equal(failure.kind, "22012")?

@@ -75,6 +75,10 @@ export opaque type Pool:
 
 // Starts `size` workers, each opening its own connection.
 export fn start(config: Config, size: Int) Pool!:
+	if size < 1: return error(
+		Error("postgres: a pool needs at least one worker", kind: "EINVAL")
+	)
+
 	var slots = List[Slot]()
 
 	for _i in 0..size:
@@ -125,22 +129,33 @@ fn var Pool.query(sql: String, params: List[Value] = []) Rows!:
 	index := self.submit(Statement(sql.clone(), params.clone()))?
 	return self.take(index)
 
+// Statements queued per worker before their replies are read. A worker blocks writing
+// replies once its reply pipe is full, so queueing more than the pipe capacity (64)
+// before reading would deadlock.
+BATCH_PER_WORKER: Int := 32
+
 // Runs statements concurrently across the workers; results are in statement order. The
 // first failure is returned after every reply has been read.
 fn var Pool.query_all(statements: List[Statement]) List[Rows]!:
-	var order = List[Int]()
-	for statement in statements: order.append(self.submit(statement.clone())?)
-
 	var results = List[Rows]()
 	var failure: Error? = none
+	window := self.slots.length() * BATCH_PER_WORKER
+	var start = 0
 
-	for index in order:
-		got := self.take(index)
+	while start < statements.length():
+		var order = List[Int]()
+		stop := (start + window).min(statements.length())
+		for i in start..stop: order.append(self.submit(statements[i].clone())?)
 
-		if got.is_error():
-			failure = got.err().clone()
-		else:
-			results.append(got?)
+		for index in order:
+			got := self.take(index)
+
+			if got.is_error():
+				if failure.is_none(): failure = got.err().clone()
+			else:
+				results.append(got?)
+
+		start = stop
 
 	if f := failure: return error(f)
 
@@ -153,4 +168,4 @@ fn var Pool.close() Void!:
 	for i in 0..self.slots.length():
 		self.slots[i].task.wait()?
 	self.slots = []
-	return ok(unit)
+	return ok()
