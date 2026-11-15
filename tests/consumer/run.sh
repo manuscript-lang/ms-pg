@@ -18,8 +18,7 @@ case "$path" in /*) url="file://$path#v1.0.0" ;; *) url="file:///$path#v1.0.0" ;
 cp -r "$here/ms.toml" "$here/src" "$work/app/"
 export MS_PACKAGE_CACHE="$work/cache"
 cd "$work/app"
-sed -i.bak "s|PACKAGE_URL|$url|" ms.toml
-"$ms" fetch
+"$ms" add "${url%#*}" --tag "${url#*#}" --as @pg --allow
 out=$("$ms" run)
 [ "$out" = "Value.Int(42)" ] || { echo "unexpected output: $out" >&2; exit 1; }
 echo "consumer ok"
