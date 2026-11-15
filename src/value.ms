@@ -3,7 +3,7 @@
 import (
 	Bytes from "@std/bytes.ms",
 	hex_decode, hex_encode from "@std/data/encoding.ms",
-	Timestamp from "@std/time.ms",
+	Timestamp, parse_timestamp from "@std/time.ms",
 )
 
 // Type OIDs the client decodes from the binary format.
@@ -51,6 +51,48 @@ fn Value.as_text() String?:
 			day := Timestamp(seconds: days * 86400, nanos: 0).to_string()
 			return day.slice(0, 10).get("")
 
+// Typed access: each returns the payload when the value is that variant, and none for
+// any other variant (including `Null`).
+fn Value.int() Int?:
+	match self:
+		Value.Int(value): return value
+		_: return none
+
+fn Value.float() Float?:
+	match self:
+		Value.Float(value): return value
+		_: return none
+
+fn Value.bool() Bool?:
+	match self:
+		Value.Bool(value): return value
+		_: return none
+
+fn Value.text() String?:
+	match self:
+		Value.Text(value): return value.clone()
+		_: return none
+
+fn Value.bytes() Bytes?:
+	match self:
+		Value.Bytes(value): return value.clone()
+		_: return none
+
+fn Value.timestamp() Timestamp?:
+	match self:
+		Value.Timestamp(value): return value
+		_: return none
+
+fn Value.date() Int?:
+	match self:
+		Value.Date(days): return days
+		_: return none
+
+fn Value.is_null() Bool:
+	match self:
+		Value.Null: return true
+		_: return false
+
 // The text-format bytes sent for a parameter; none is NULL.
 export fn encode_value(value: Value) Bytes?:
 	text := value.as_text()
@@ -64,8 +106,61 @@ fn bad(type_name: String, text: String) Error:
 		kind: "EBADMSG",
 	)
 
-// Decodes one column by the column's type OID and format code (0 text, 1 binary). A
-// value that does not parse is an error.
+// Normalizes PostgreSQL's timestamp text ("2026-01-01 00:00:01.5+00", "... +05:30" or
+// no offset) to RFC 3339. A `timestamp` has no offset and is read as UTC, as in binary.
+fn rfc3339(text: String) String:
+	joined := text.replace(" ", "T")
+	if joined.length() < 11: return joined
+
+	sign := joined.slice(joined.length() - 3, joined.length() - 2).get("")
+	if sign == "+" or sign == "-": return "{joined}:00"
+
+	longer := joined.slice(joined.length() - 6, joined.length() - 5).get("")
+	if longer == "+" or longer == "-": return joined
+	if joined.ends_with("Z"): return joined
+
+	return "{joined}Z"
+
+fn decode_text_timestamp(text: String) Value!:
+	if text == "infinity" or text == "-infinity": return ok(Value.Text(text))
+
+	stamp := parse_timestamp(rfc3339(text)).map_error(fn _e: bad("timestamp", text))?
+	return ok(Value.Timestamp(stamp))
+
+fn decode_text_date(text: String) Value!:
+	if text == "infinity" or text == "-infinity": return ok(Value.Text(text))
+
+	stamp := parse_timestamp("{text}T00:00:00Z").map_error(fn _e: bad("date", text))?
+	return ok(Value.Date(stamp.seconds / 86400))
+
+// Decodes a column sent in text format into the same `Value` the binary format gives.
+fn decode_text(type_oid: Int, text: String) Value!:
+	if type_oid == BOOL: return ok(Value.Bool(text == "t"))
+	if type_oid == INT8 or type_oid == INT2 or type_oid == INT4 or type_oid == OID:
+		return ok(Value.Int(text.parse_int().ok_or(bad("integer", text))?))
+	if type_oid == FLOAT8:
+		return ok(Value.Float(text.parse_float().ok_or(bad("float", text))?))
+
+	if type_oid == FLOAT4:
+		// Text holds the shortest decimal of a float4 ("0.1"). Round it to float4 and
+		// widen it, which is the value the binary format carries (0.10000000149011612).
+		wide := text.parse_float().ok_or(bad("float", text))?
+		single := wide.to_float32().ok_or(bad("float4", text))?
+		return ok(Value.Float(single.to_float()))
+
+	if type_oid == TIMESTAMP or type_oid == TIMESTAMPTZ:
+		return decode_text_timestamp(text)
+	if type_oid == DATE: return decode_text_date(text)
+
+	if type_oid == BYTEA:
+		if not text.starts_with("\\x"): return error(bad("bytea", text))
+		return ok(Value.Bytes(hex_decode(text.slice(2, text.length())?, none)?))
+
+	return ok(Value.Text(text))
+
+// Decodes one column by the column's type OID and format code (0 text, 1 binary). Both
+// formats give the same `Value` variant for a type; a value that does not parse is an
+// error.
 export fn decode_value(type_oid: Int, format: Int, raw: Bytes?) Value!:
 	if raw.is_none(): return ok(Value.Null)
 
@@ -75,17 +170,7 @@ export fn decode_value(type_oid: Int, format: Int, raw: Bytes?) Value!:
 	text := bytes.decode_utf8().ok_or(
 		Error("postgres: column is not valid UTF-8", kind: "EBADMSG")
 	)?
-	if type_oid == 16: return ok(Value.Bool(text == "t"))
-	if type_oid == 20 or type_oid == 21 or type_oid == 23 or type_oid == 26:
-		return ok(Value.Int(text.parse_int().ok_or(bad("integer", text))?))
-	if type_oid == 700 or type_oid == 701:
-		return ok(Value.Float(text.parse_float().ok_or(bad("float", text))?))
-
-	if type_oid == 17:
-		if not text.starts_with("\\x"): return error(bad("bytea", text))
-		return ok(Value.Bytes(hex_decode(text.slice(2, text.length())?, none)?))
-
-	return ok(Value.Text(text))
+	return decode_text(type_oid, text)
 
 // Whether `type_oid` has a binary decoder here; other columns stay in text format.
 export fn is_binary_type(type_oid: Int) Bool:

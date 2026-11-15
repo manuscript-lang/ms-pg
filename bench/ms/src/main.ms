@@ -3,7 +3,6 @@
 import (
 	promise from "@std/concurrency/promise.ms",
 	arguments, environment from "@std/os/env.ms",
-	parse_timestamp from "@std/time.ms",
 
 	Config, Conn, open from "@pg/conn.ms",
 	Value from "@pg/value.ms",
@@ -43,17 +42,11 @@ fn worker(id: Int, queries: Int) Int!:
 	conn.close()?
 	return ok(sum)
 
-// Seconds plus microseconds of a timestamptz column. The text format arrives as `Text`
-// and is parsed here, which is what a text-format client pays; the binary format
-// arrives decoded.
+// Seconds plus microseconds of a timestamptz column. Both formats arrive as
+// `Value.Timestamp`; the text format pays to parse it in the client.
 fn stamp_sum(value: Value) Int!:
-	match value:
-		Value.Timestamp(stamp): return ok(stamp.seconds + stamp.nanos / 1000)
-		Value.Text(text):
-			// "2026-01-01 00:00:01.000123+00" is not RFC 3339 yet.
-			stamp := parse_timestamp("{text.replace(" ", "T")}:00")?
-			return ok(stamp.seconds + stamp.nanos / 1000)
-		_: return error(Error("ts is not a timestamp"))
+	stamp := value.timestamp().ok_or(Error("ts is not a timestamp"))?
+	return ok(stamp.seconds + stamp.nanos / 1000)
 
 fn int_of(value: Value) Int!:
 	match value:
@@ -71,8 +64,6 @@ fn scaled(x: Float, factor: Float) Int:
 // Reads RANGE consecutive rows of the numbers table per query and sums every column.
 fn numbers_worker(id: Int, queries: Int) Int!:
 	var conn = open(config()?)?
-	void conn.simple("set time zone 'UTC'")?
-
 	statement := conn.prepare(
 		"range",
 		"select id, a, b, c, ts from readings where id between $1 and $2",
