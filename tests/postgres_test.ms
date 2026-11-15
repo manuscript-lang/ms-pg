@@ -20,6 +20,7 @@ import (
 	cancel,
 	open from "@pg/conn.ms",
 	config_from_env, parse_config from "@pg/dsn.ms",
+	interpolate, named from "@pg/sql.ms",
 	LoMode,
 	Whence,
 	lo_close,
@@ -979,3 +980,39 @@ test "enums, composites, domains, ranges and hstore load by name":
 	void binary_conn.simple("drop type pg_pair, pg_mood, pg_span cascade")?
 	void binary_conn.simple("drop domain pg_posint")?
 	binary_conn.close()?
+
+test "named arguments and simple protocol substitution skip quoted text":
+	var args = Map[String, Value]()
+	args.add("id", Value.Int(7))
+	args.add("name", Value.Text("o'brien"))
+	rewritten := named("select @id, '@id', @name, @id -- @id\n, @@x", args)?
+	expect_equal(rewritten.sql, "select $1, '@id', $2, $1 -- @id\n, @x")?
+	expect_equal(rewritten.params.length(), 2)?
+	void expect_error(named("select @missing", args))?
+	text := interpolate("select $1, '$1', $2, $3, $4", [Value.Int(1), Value.Text("it's"), Value.Null, Value.Bool(true)])?
+	expect_equal(text, "select 1, '$1', 'it''s', NULL, true")?
+	void expect_error(interpolate("select $2", [Value.Int(1)]))?
+
+test "named, simple and binary COPY paths agree with the extended protocol":
+	var conn = open(config()?)?
+	var args = Map[String, Value]()
+	args.add("n", Value.Int(41))
+	named_rows := conn.query_named("select @n::int8 + 1", args)?
+	expect_equal(named_rows.rows[0][0], Value.Int(42))?
+	simple_rows := conn.query_simple("select $1::int8 + 1, $2::text", [Value.Int(41), Value.Text("a'b")])?
+	expect_equal(simple_rows.rows[0][1], Value.Text("a'b"))?
+	expect_equal(simple_rows.verb(), "SELECT")?
+
+	void conn.simple("create temp table bc (id int8, note text, at timestamptz, raw bytea, ok bool)")?
+	stamp := Timestamp(seconds: 1700000000, nanos: 0)
+	rows := [
+		[Value.Int(1), Value.Text("a"), Value.Timestamp(stamp.clone()), Value.Bytes(Bytes([0, 1])), Value.Bool(true)],
+		[Value.Int(2), Value.Null, Value.Null, Value.Null, Value.Bool(false)],
+	]
+	stored := conn.copy_from_binary(["bc"], [], from_list(rows))?
+	expect_equal(stored, 2)?
+	back := conn.query("select id, note, at, raw, ok from bc order by id", [])?
+	expect_equal(back.rows[0][2], Value.Timestamp(stamp))?
+	expect_equal(back.rows[1][1], Value.Null)?
+	void expect_error(conn.copy_from_binary(["bc"], ["id"], from_list([[Value.Text("x")]])))?
+	conn.close()?

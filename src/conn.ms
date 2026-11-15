@@ -14,6 +14,7 @@ import (
 	TypeInfo,
 	is_binary_type from "@pg/decode.ms",
 	Value, encode_value from "@pg/value.ms",
+	interpolate, named from "@pg/sql.ms",
 	Backend,
 	Field,
 	PORTAL,
@@ -861,21 +862,17 @@ fn copy_field(value: Value) String:
 fn copy_line(row: List[Value]) Bytes:
 	return f"{row.map(fn v: copy_field(v)).join("\t")}\n".to_bytes()
 
-// Loads rows into a table with `COPY ... FROM STDIN`, in the text format, and returns
-// how many the server stored. `table` is the table's name parts
-// (`["public", "items"]`); the names are quoted. Rows come from a stream, so a pipeline
-// feeds it:
-// `conn.copy_from(["items"], ["id", "name"], rows | map(...))`. Rows are sent in
-// batches of at most 64 KiB. When the stream fails, the COPY is aborted and nothing is
-// stored.
-fn var Conn.copy_from(
-	table: List[String],
-	columns: List[String],
+// Runs a `COPY ... FROM STDIN` statement: sends `head`, each row through `encode`, then
+// `tail`, in chunks of at most 64 KiB, and returns how many rows the server stored.
+// When the stream or `encode` fails, the COPY is aborted and nothing is stored.
+fn var Conn.copy_in(
+	statement: String,
+	encode: fn(List[Value]) Bytes!,
+	head: Bytes,
+	tail: Bytes,
 	rows: ReadStream[List[Value]],
 ) Int!:
-	target := table.map(fn t: quote_ident(t)).join(".")
-	names := if columns.is_empty(): "" else: f" ({columns.map(fn c: quote_ident(c)).join(", ")})"
-	self.send(query(f"COPY {target}{names} FROM STDIN")?)?
+	self.send(query(statement)?)?
 
 	var failure: Error? = none
 
@@ -884,8 +881,7 @@ fn var Conn.copy_from(
 
 		match message:
 			Backend.CopyInResponse: break
-			Backend.ErrorResponse(found):
-				failure = server_error(found)
+			Backend.ErrorResponse(found): failure = server_error(found)
 			Backend.ReadyForQuery(status):
 				self.status = status
 				if f := failure: return error(f)
@@ -894,7 +890,8 @@ fn var Conn.copy_from(
 			_: continue
 
 	var pending = BytesBuilder()
-	var size = 0
+	pending.append_bytes(head)
+	var size = head.length()
 	var source = rows
 	var cause: Error? = none
 
@@ -908,9 +905,14 @@ fn var Conn.copy_from(
 		item := next?
 		if item.is_none(): break
 
-		line := copy_line(item.get([]))
-		size += line.length()
-		pending.append_bytes(line)
+		line := encode(item.get([]))
+		if line.is_error():
+			cause = line.err().clone()
+			break
+
+		chunk := line?
+		size += chunk.length()
+		pending.append_bytes(chunk)
 
 		if size >= 65536:
 			self.send(copy_data(pending.drain())?)?
@@ -919,7 +921,8 @@ fn var Conn.copy_from(
 	if cause.is_some():
 		self.send(copy_fail("input failed")?)?
 	else:
-		if size > 0: self.send(copy_data(pending.drain())?)?
+		pending.append_bytes(tail)
+		self.send(copy_data(pending.drain())?)?
 		self.send(copy_done()?)?
 
 	var tag = ""
@@ -940,6 +943,84 @@ fn var Conn.copy_from(
 	if f := failure: return error(f)
 
 	return ok(Rows([], [], tag).affected().get(0))
+
+fn copy_target(table: List[String], columns: List[String]) String:
+	target := table.map(fn t: quote_ident(t)).join(".")
+	if columns.is_empty(): return target
+
+	return f"{target} ({columns.map(fn c: quote_ident(c)).join(", ")})"
+
+// Loads rows into a table with `COPY ... FROM STDIN`, in the text format, and returns
+// how many the server stored. `table` is the table's name parts
+// (`["public", "items"]`); the names are quoted. Rows come from a stream, so a pipeline
+// feeds it: `conn.copy_from(["items"], ["id", "name"], rows | map(...))`.
+fn var Conn.copy_from(
+	table: List[String],
+	columns: List[String],
+	rows: ReadStream[List[Value]],
+) Int!:
+	return self.copy_in(
+		f"COPY {copy_target(table, columns)} FROM STDIN",
+		fn row: ok(copy_line(row)),
+		Bytes([]),
+		Bytes([]),
+		rows,
+	)
+
+// One row of binary COPY: a field count, then each field as a length and its bytes.
+fn binary_copy_row(oids: List[Int], row: List[Value]) Bytes!:
+	if row.length() != oids.length(): return error(
+		Error("postgres: COPY row has the wrong number of columns", kind: "EINVAL")
+	)
+
+	var out = BytesBuilder()
+	out.append_int16_be(oids.length().to_int16().get(0))
+
+	for i in 0..oids.length():
+		param := encode_param(oids[i], row[i])
+
+		if data := param.data:
+			if param.format != 1: return error(
+				Error(
+					f"postgres: column {i} has no binary encoding for this value; use copy_from",
+					kind: "ENOTSUP",
+				)
+			)
+
+			out.append_int32_be(data.length().to_int32().get(0))
+			out.append_bytes(data)
+		else:
+			out.append_int32_be(-1)
+
+	return ok(out.build())
+
+// Like `copy_from`, in the binary format: faster and exact, but each value must have a
+// binary encoding for its column (integers, floats, bool, bytea, text, uuid, date and
+// timestamps). The column types come from the server, so the table must exist.
+fn var Conn.copy_from_binary(
+	table: List[String],
+	columns: List[String],
+	rows: ReadStream[List[Value]],
+) Int!:
+	names := if columns.is_empty(): "*" else: columns.map(fn c: quote_ident(c)).join(", ")
+	probe := self.prepare("", f"select {names} from {table.map(fn t: quote_ident(t)).join(".")}")?
+	oids := probe.columns.map(fn c: c.type_oid)
+
+	var head = BytesBuilder()
+	head.append_bytes(Bytes([80, 71, 67, 79, 80, 89, 10, 255, 13, 10, 0]))
+	head.append_int32_be(0)
+	head.append_int32_be(0)
+
+	var tail = BytesBuilder()
+	tail.append_int16_be(-1)
+
+	return self.copy_in(
+		f"COPY {copy_target(table, columns)} FROM STDIN (FORMAT binary)",
+		fn row: binary_copy_row(oids, row),
+		head.build(),
+		tail.build(),
+		rows,
+	)
 
 fn unescape_copy(text: String) Value:
 	if text == "\\N": return Value.Null
@@ -1117,3 +1198,18 @@ fn var Conn.load_types(names: List[String]) Void!:
 			self.types.add(array_oid, TypeInfo("array", oid))
 
 	return ok()
+
+// Runs a statement with parameters over the simple protocol by substituting the values
+// into the text on the client (pgx's simple protocol mode), for poolers such as
+// PgBouncer in statement mode. Every result column is text-decoded.
+fn var Conn.query_simple(sql: String, params: List[Value]) Rows!:
+	return self.simple(interpolate(sql, params)?)
+
+// Runs a statement whose placeholders are `@name`, with values from `args`.
+fn var Conn.query_named(sql: String, args: Map[String, Value]) Rows!:
+	rewritten := named(sql, args)?
+	return self.query(rewritten.sql, rewritten.params)
+
+// The command's first word: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `COPY` and so on.
+fn Rows.verb() String:
+	return self.command.split(" ", none)[0].clone()
