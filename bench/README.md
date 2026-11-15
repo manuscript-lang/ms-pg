@@ -11,7 +11,19 @@ MS=path/to/ms bench/run.sh 25
 
 Designs match: one connection per worker, one prepared statement, strictly sequential lookups. Differences that are not the language: pgx and tokio-postgres fetch results in the binary format, and the Manuscript client now does too for prepared statements (`BINARY=0` switches it to text); the server runs on the same machine and shares its 4 cores with the clients; `tokio-postgres` spawns a task per connection on a multi-thread runtime.
 
-## Point lookups, 2026-11-15, Linux amd64, 4 cores (Xeon 2.10 GHz), PostgreSQL 16 on localhost, manuscript revision ff75ca4d
+## Point lookups after the scheduler fix, 2026-11-15, same machine, manuscript revision 2283f91f
+
+manuscript #4117 fixed the runtime starting four waiting promises on two or three threads, which caused most of the run-to-run swings below. Median of 25 alternating runs, with the fastest and slowest run:
+
+| Program | Median | Min | Max | Lookups per second (median) |
+| --- | --- | --- | --- | --- |
+| Manuscript (binary results) | 0.671 s | 0.575 s | 2.064 s | 119,282 |
+| Go pgx v5.13.0 | 1.033 s | 0.823 s | 1.422 s | 77,440 |
+| Rust tokio-postgres 0.7.18 | 1.674 s | 1.549 s | 2.058 s | 47,803 |
+
+Manuscript is now clearly ahead of pgx on the median here, with its slowest run in 25 (2.06 s) still above pgx's. A separate 25-run comparison of the runtime before and after the fix, same program: median 0.947 s to 0.645 s, slowest 1.595 s to 1.029 s. Treat the tail as unexplained; the machine is shared with the server.
+
+## Point lookups before the scheduler fix, 2026-11-15, Linux amd64, 4 cores (Xeon 2.10 GHz), PostgreSQL 16 on localhost, manuscript revision ff75ca4d
 
 Median of 25 alternating runs, with the fastest and slowest run:
 
@@ -21,7 +33,7 @@ Median of 25 alternating runs, with the fastest and slowest run:
 | Go pgx v5.13.0 | 1.055 s | 0.717 s | 1.355 s | 75,805 |
 | Rust tokio-postgres 0.7.18 | 1.699 s | 1.519 s | 1.849 s | 47,081 |
 
-This benchmark does not show a winner between Manuscript and pgx. The shared VM moves Manuscript between 0.57 s and 1.98 s from run to run, wider than any gap between the two, and the lookups are network-bound, so text versus binary makes no reliable difference either (7 alternating runs: median 1.165 s text, 1.036 s binary). An earlier single dated run (0.687 s Manuscript, 0.884 s pgx) fell inside this spread and is not a lead. Only tokio-postgres is consistently slower; the likely cause is its runtime sharing the 4 cores with the server, not the library, and that is not investigated. Instruction counts (`valgrind --tool=callgrind`) have not been taken.
+Before the scheduler fix, this benchmark did not show a winner between Manuscript and pgx. The shared VM moves Manuscript between 0.57 s and 1.98 s from run to run, wider than any gap between the two, and the lookups are network-bound, so text versus binary makes no reliable difference either (7 alternating runs: median 1.165 s text, 1.036 s binary). An earlier single dated run (0.687 s Manuscript, 0.884 s pgx) fell inside this spread and is not a lead. Only tokio-postgres is consistently slower; the likely cause is its runtime sharing the 4 cores with the server, not the library, and that is not investigated. Instruction counts (`valgrind --tool=callgrind`) have not been taken.
 
 ## Numbers: ints, floats and timestamps
 
@@ -39,3 +51,14 @@ Median of 25 alternating runs, with the fastest and slowest run:
 | Rust tokio-postgres 0.7.18 | 0.239 s | 0.167 s | 0.291 s | 3,340,626 |
 
 Binary is about 1.9x faster than text for Manuscript here, and the ranges barely overlap (binary at most 0.515 s, text at least 0.469 s). Against pgx the medians are 13% apart but the ranges overlap, so call it close; tokio-postgres is ahead of both. Run-to-run spread on this shared VM is large, so read ratios between rows, not absolute times.
+
+### After the scheduler fix (manuscript #4117), 25 runs
+
+| Program | Median | Min | Max | Rows per second (median) |
+| --- | --- | --- | --- | --- |
+| Manuscript, binary | 0.338 s | 0.278 s | 0.477 s | 2,366,333 |
+| Manuscript, text | 0.560 s | 0.396 s | 0.772 s | 1,428,079 |
+| Go pgx v5.13.0 | 0.315 s | 0.281 s | 0.417 s | 2,537,016 |
+| Rust tokio-postgres 0.7.18 | 0.248 s | 0.204 s | 0.277 s | 3,225,283 |
+
+Binary is 1.7x faster than text, about 7% behind pgx (ranges overlap), and behind tokio-postgres. The scheduler fix changed little here: each worker has a long result to decode, so the numbers path was already close to four threads.
