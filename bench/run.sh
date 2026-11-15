@@ -45,9 +45,10 @@ workers=${WORKERS:-4}
 queries=${QUERIES:-20000}
 if [ "$BENCH" = numbers ]; then per=1000; label=rows/s; else per=1; label=queries/s; fi
 echo "$expected; $workers connections x $queries statements, median of $samples"
-printf '%-22s%10s%12s\n' program seconds "$label"
+printf '%-22s%10s%10s%10s%12s\n' program median min max "$label"
 for ((which = 0; which < count; which++)); do
-  median=$(awk -v w="$which" '$1 == w { print $2 }' "$times" | sort -g | awk '{ v[NR] = $1 } END { print (NR % 2) ? v[(NR + 1) / 2] : (v[NR / 2] + v[NR / 2 + 1]) / 2 }')
-  printf '%-22s%10.3f%12.0f\n' "${names[$which]}" "$median" "$(echo "$workers * $queries * $per / $median" | bc -l)"
+  stats=$(awk -v w="$which" '$1 == w { print $2 }' "$times" | sort -g | awk '{ v[NR] = $1 } END { print (NR % 2) ? v[(NR + 1) / 2] : (v[NR / 2] + v[NR / 2 + 1]) / 2, v[1], v[NR] }')
+  read -r median low high <<< "$stats"
+  printf '%-22s%10.3f%10.3f%10.3f%12.0f\n' "${names[$which]}" "$median" "$low" "$high" "$(echo "$workers * $queries * $per / $median" | bc -l)"
 done
 rm -f "$times"
