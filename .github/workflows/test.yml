@@ -27,15 +27,16 @@ jobs:
           - {os: darwin, runner: macos-15, arch: arm64}
           - {os: windows, runner: windows-2025, arch: amd64}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          path: pg
+      # manuscript goes at the workspace root, because its composite actions refer to each other
+      # as `./.github/actions/...`, which resolves from the workspace root.
       - uses: actions/checkout@v7
         with:
           repository: manuscript-lang/manuscript
           ref: ${{ inputs.ms_ref || 'main' }}
-          path: ms
-      - uses: ./ms/.github/actions/rust-env
+      - uses: actions/checkout@v7
+        with:
+          path: pg
+      - uses: ./.github/actions/rust-env
         with:
           os: ${{ matrix.os }}
           arch: ${{ matrix.arch }}
@@ -45,7 +46,6 @@ jobs:
         run: brew install postgresql@16
       - name: Build ms
         shell: bash
-        working-directory: ms
         run: |
           cargo xtask runtime
           cargo build --release --locked -p ms-cli
@@ -63,7 +63,7 @@ jobs:
           esac
           export PG_BIN
           "$PG_BIN/postgres" --version
-          ms="$PWD/ms/target/release/ms"
+          ms="$PWD/target/release/ms"
           # initdb refuses to run as root; the hosted runners are not root.
           vars=$(pg/tests/start-postgres.sh "$RUNNER_TEMP/pg")
           export $vars
