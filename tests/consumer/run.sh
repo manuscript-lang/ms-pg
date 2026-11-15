@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Consumes packages/postgres the way a user would: as a git dependency, fetched into a cache, locked, then run.
+# Consumes this package the way a user would: as a git dependency, fetched into a cache, locked, then run.
 # Needs a server (see start-postgres.sh) and the PG* variables it prints; MS is the ms binary.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
