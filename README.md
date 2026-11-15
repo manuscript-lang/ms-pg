@@ -38,16 +38,13 @@ names := collect(big, max_items: 1000)?
 evens := collect(rows.stream() | filter(fn row: row[0].int().get(0) % 2 == 0), max_items: 100)?
 ```
 
-On a pooled connection, `pool.stream(sql, params)` returns a real `ReadStream` of rows. The caller gets a pipe of its own and the worker keeps its connection, so there is no extra login and streams from different calls do not share a reader:
+On a pooled connection, `pool.each(sql, params, fn row: ...)` hands each row to a function as the worker's connection receives it, so a large result never sits in memory:
 
 ```manuscript
-var source = pool.stream("select n from big")?
-evens := collect(source | filter(fn row: row[0].int().get(0) % 2 == 0), max_items: 100)?
+header := pool.each("select n from big", [], fn row: add_total(var total, row))?
 ```
 
-A server error is the stream's last item. A stream that is not read holds its worker through back pressure: read it to the end or close it before asking the same worker for more, and close every stream before `pool.close()`. `pool.each(sql, params, fn row: ...)` is the callback form of the same thing.
-
-This needs `Pipe.ticket()` from the standard library (manuscript-lang/manuscript#4132): the request carries a plain-data ticket for the caller's pipe, and the worker opens it.
+`each` is a callback, not a `ReadStream`: a stream cannot hold a pooled connection and give it back, and a pipe cannot carry a stream end (issue #9).
 
 `stream` runs the query in a task with its own connection (a task cannot borrow yours), so each stream pays one login. A server or login error is the stream's last item; closing the stream early (`take`, `break`) stops the query.
 

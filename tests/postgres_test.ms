@@ -446,39 +446,3 @@ test "a pool streams rows from a pooled connection":
 	broken := expect_error(pool.each("select 1/0", [], fn row: refuse(row)))?
 	expect_equal(broken.kind, "22012")?
 	pool.close()?
-
-test "a pool returns a stream and keeps the connection in its worker":
-	var pool = start(config()?, 2)?
-
-	// Two live streams at once, on different workers, each its own pipe.
-	var first = pool.stream("select n from generate_series(1, 5000) n")?
-	var second = pool.stream("select n * 2 from generate_series(1, 5000) n")?
-	sum_first := fold(first | map(fn row: row[0].int().get(0)), 0, fn sum, n: (sum + n))?
-	sum_second := fold(second | map(fn row: row[0].int().get(0)), 0, fn sum, n: (sum + n))?
-	expect_equal(sum_first, 12502500)?
-	expect_equal(sum_second, 25005000)?
-
-	// Pipeline steps compose, and the same workers still serve plain queries.
-	var source = pool.stream("select n from generate_series(1, 100) n")?
-	rows := collect(
-		source | filter(fn row: row[0].int().get(0) % 2 == 0) | take(5),
-		max_items: 10
-	)?
-	expect_equal(rows.length(), 5)?
-	after := pool.query("select 7::int")?
-	expect_equal(after.rows[0][0], Value.Int(7))?
-
-	// Closing a stream early leaves the worker in step.
-	var early = pool.stream("select n from generate_series(1, 100000) n")?
-	void early.next()
-	early.close()?
-	var again = 0
-	while again < 4:
-		check := pool.query("select 1::int")?
-		expect_equal(check.rows[0][0], Value.Int(1))?
-		again += 1
-
-	// A server error is the last item.
-	broken := expect_error(collect(pool.stream("select 1/0")?, max_items: 10))?
-	expect_equal(broken.kind, "22012")?
-	pool.close()?

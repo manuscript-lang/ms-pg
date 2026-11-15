@@ -277,8 +277,7 @@ fn var Conn.authenticate(config: Config) Void!:
 // Reads messages up to ReadyForQuery, handing each decoded row to `emit` as it arrives.
 // A server error or a value that cannot be decoded is remembered, and the first one is
 // returned once the server has finished, so the connection stays usable. A failed read
-// is returned at once. A failed `emit` (a consumer that went away) is remembered like a
-// server error: the rest of the reply is read and dropped so the connection stays usable. The result holds
+// or a failed `emit` ends the connection's use and returns at once. The result holds
 // the column names and command tag, with no rows.
 fn var Conn.pump(known: List[Field], emit: fn(List[Value]) Void!) Rows!:
 	var fields = known.clone()
@@ -312,9 +311,7 @@ fn var Conn.pump(known: List[Field], emit: fn(List[Value]) Void!) Rows!:
 
 					row.append(decoded?)
 
-				if failure.is_none():
-					sent := emit(row)
-					if sent.is_error(): failure = sent.err().clone()
+				if failure.is_none(): emit(row)?
 			Backend.CommandComplete(tag): command = tag.clone()
 			Backend.ErrorResponse(found):
 				if failure.is_none(): failure = server_error(found)
