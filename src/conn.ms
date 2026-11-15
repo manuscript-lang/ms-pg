@@ -36,8 +36,8 @@ export type Config:
 	password: String = ""
 	database: String = "postgres"
 	application_name: String = "manuscript"
-	// TLS from the first byte (PostgreSQL 17 direct negotiation, ALPN `postgresql` is
-	// added); none is plain TCP.
+	// TLS negotiated with an SSLRequest on the plain connection, then the same socket
+	// is upgraded; none is plain TCP.
 	tls: TlsOptions? = none
 	// Accept an md5 password challenge. Off by default: md5 is weak, and SCRAM-SHA-256
 	// is always accepted.
@@ -45,7 +45,8 @@ export type Config:
 	timeout: Duration? = none
 	// Fetch the columns of prepared statements in binary format where a decoder exists
 	// (integers, floats, bool, bytea, text, uuid, date, timestamp). Other columns, such
-	// as numeric, stay text. Off gives text for everything.
+	// as numeric, stay text. Off gives text for everything. The format only changes
+	// speed: every call path returns the same `Value` variants.
 	binary_results: Bool = true
 
 // The result of one statement.
@@ -89,7 +90,7 @@ fn protocol(what: String) Error:
 // Makes at least `count` unread bytes available, joining chunks once so a large message
 // costs linear time.
 fn var Conn.need(count: Int) Void!:
-	if self.buffer.length() - self.pos >= count: return ok(unit)
+	if self.buffer.length() - self.pos >= count: return ok()
 
 	var joined = BytesBuilder()
 	joined.append_bytes(self.buffer.slice(self.pos, self.buffer.length())?)
@@ -111,7 +112,7 @@ fn var Conn.need(count: Int) Void!:
 
 	self.buffer = joined.build()
 	self.pos = 0
-	return ok(unit)
+	return ok()
 
 // Reads the next message, skipping notices, parameter changes and ignorable messages. A
 // server error arrives as `ErrorResponse`, since the server keeps the stream in step
@@ -259,11 +260,11 @@ fn var Conn.authenticate(config: Config) Void!:
 				self.secret = secret
 			Backend.ReadyForQuery(status):
 				self.status = status
-				return ok(unit)
+				return ok()
 			Backend.ErrorResponse(fields): return error(server_error(fields))
 			_: continue
 
-	return ok(unit)
+	return ok()
 
 // Reads messages up to ReadyForQuery, collecting rows. A server error or a value that
 // cannot be decoded is remembered, and the first one is returned once the server has
@@ -332,19 +333,19 @@ fn var Conn.query(sql: String, params: List[Value]) Rows!:
 	return self.collect([])
 
 fn var Conn.begin() Void!:
-	_ := self.simple("BEGIN")?
-	return ok(unit)
+	void self.simple("BEGIN")?
+	return ok()
 
 fn var Conn.commit() Void!:
-	_ := self.simple("COMMIT")?
-	return ok(unit)
+	void self.simple("COMMIT")?
+	return ok()
 
 fn var Conn.rollback() Void!:
-	_ := self.simple("ROLLBACK")?
-	return ok(unit)
+	void self.simple("ROLLBACK")?
+	return ok()
 
 fn var Conn.close() Void!:
-	_ := self.send(terminate()?)
+	void self.send(terminate()?)
 	return self.net.close()
 
 // A statement parsed once on the server and run many times.
@@ -408,7 +409,7 @@ fn var Conn.transaction[T](body: fn(var Conn) T!) T!:
 	result := body(var self)
 
 	if result.is_error():
-		_ := self.rollback()
+		void self.rollback()
 		return result
 
 	self.commit()?

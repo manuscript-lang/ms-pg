@@ -13,9 +13,14 @@ decoder for its type: `int2`, `int4`, `int8`, `oid`, `float4`, `float8`, `bool`,
 message. Parameters are still sent as text, and `Conn.query` (one round trip, columns unknown until it returns) stays
 text. Set `Config.binary_results` to false for text everywhere.
 
-A binary `timestamp` or `timestamptz` arrives as `Value.Timestamp` (UTC) and a `date` as `Value.Date` (days since
-1970-01-01); in text format both are `Value.Text`, because their meaning depends on the session time zone. A `uuid` is
-`Value.Text` in both formats, and `infinity` values are `Value.Text("infinity")` and `Value.Text("-infinity")`.
+## Typed values
+
+The format changes speed, never the type: `Conn.query`, `Conn.simple`, `Conn.run` and the pool all return the same
+`Value` variant for a column, in text or binary. A `timestamp` or `timestamptz` is `Value.Timestamp` (UTC; a `timestamp`
+without a zone is read as UTC), a `date` is `Value.Date` (days since 1970-01-01), a `uuid` is `Value.Text`, and
+`infinity` values are `Value.Text("infinity")` and `Value.Text("-infinity")`. A `float4` widens exactly to a `Float`, so
+`0.1::float4` is 0.10000000149011612 in both formats. Read values with `value.int()`, `float()`, `bool()`, `text()`,
+`bytes()`, `timestamp()`, `date()` (each `none` for another variant) and `is_null()`.
 
 ## Logins
 
@@ -44,7 +49,7 @@ fn main() Void!:
 ```
 
 `Pool` (`@pg/pool.ms`) runs statements on worker tasks that each own one connection. A connection cannot move
-between tasks, so statements travel to the workers over pipes and rows travel back; one task owns the `Pool`.
+between tasks, so statements travel to the workers over pipes and rows travel back; one task owns the `Pool`. `query_all` queues at most 32 statements per worker before reading replies, so any number of statements is safe. Pool statements use the text format.
 
 ## Tests
 

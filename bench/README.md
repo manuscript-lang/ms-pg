@@ -37,7 +37,7 @@ Before the scheduler fix, this benchmark did not show a winner between Manuscrip
 
 ## Numbers: ints, floats and timestamps
 
-`BENCH=numbers bench/run.sh 25` reads `select id, a, b, c, ts from readings where id between $1 and $2`, 1000 rows per statement, from a 100000-row table of `int8`, `int4`, `float8`, `float4` and `timestamptz` columns. 4 connections each run 200 statements (800,000 rows per run), so decoding is most of the work. Every program sums every column and the driver fails on a mismatch; the floats are exact in binary, so text and binary agree. The Manuscript text row parses the timestamp text itself, which is what a text-format client pays; the table stores timestamps with microseconds. tokio-postgres reads the timestamp as raw microseconds (a custom `FromSql`) because its date types need an extra crate.
+`BENCH=numbers bench/run.sh 25` reads `select id, a, b, c, ts from readings where id between $1 and $2`, 1000 rows per statement, from a 100000-row table of `int8`, `int4`, `float8`, `float4` and `timestamptz` columns. 4 connections each run 200 statements (800,000 rows per run), so decoding is most of the work. Every program sums every column and the driver fails on a mismatch; the floats are exact in binary, so text and binary agree. In the Manuscript text row the client parses the timestamp text into `Value.Timestamp`, so both rows return the same typed values; the table stores timestamps with microseconds. tokio-postgres reads the timestamp as raw microseconds (a custom `FromSql`) because its date types need an extra crate.
 
 ### 2026-11-15, same machine and revision
 
@@ -62,3 +62,16 @@ Binary is about 1.9x faster than text for Manuscript here, and the ranges barely
 | Rust tokio-postgres 0.7.18 | 0.248 s | 0.204 s | 0.277 s | 3,225,283 |
 
 Binary is 1.7x faster than text, about 7% behind pgx (ranges overlap), and behind tokio-postgres. The scheduler fix changed little here: each worker has a long result to decode, so the numbers path was already close to four threads.
+
+### 2026-11-15, typed text results, manuscript revision 37fcf69b
+
+The Manuscript client now decodes text-format timestamps itself (so the text row no longer parses them in the benchmark program) and the benchmark no longer sets the session time zone. Median of 15 alternating runs on a 4-core shared VM:
+
+| Program | Median | Min | Max | Rows per second (median) |
+| --- | --- | --- | --- | --- |
+| Manuscript, binary | 0.328 s | 0.230 s | 0.367 s | 2,438,003 |
+| Manuscript, text | 0.605 s | 0.458 s | 0.972 s | 1,321,761 |
+| Go pgx v5.13.0 | 0.297 s | 0.262 s | 0.349 s | 2,695,358 |
+| Rust tokio-postgres 0.7.18 | 0.215 s | 0.188 s | 0.275 s | 3,721,178 |
+
+Point lookups on the same machine, 15 runs: Manuscript 0.621 s, pgx 0.935 s, tokio-postgres 1.543 s.
