@@ -87,7 +87,7 @@ fn framed(code: UInt8, body: Bytes) Bytes!:
 	out.append_bytes(body)
 	return ok(out.build())
 
-fn cstring(var out: BytesBuilder, text: String) Unit:
+fn cstring(var out: BytesBuilder, text: String) Void:
 	out.append_bytes(text.to_bytes())
 	out.append(0)
 
@@ -154,12 +154,13 @@ export fn parse(name: String, sql: String, oids: List[Int]) Bytes!:
 	for oid in oids: body.append_int32_be(size32(oid)?)
 	return framed(PARSE, body.build())
 
-// Bind with text-format parameters (none means NULL) and binary or text results.
+// Bind with text-format parameters (none means NULL). `result_formats` holds one format
+// code per result column (0 text, 1 binary); an empty list asks for all text.
 export fn bind(
 	portal: String,
 	name: String,
 	params: List[Bytes?],
-	result_binary: Bool,
+	result_formats: List[Int],
 ) Bytes!:
 	var body = BytesBuilder()
 	cstring(var body, portal)
@@ -174,8 +175,8 @@ export fn bind(
 		else:
 			body.append_int32_be(-1)
 
-	body.append_int16_be(1)
-	body.append_int16_be(if result_binary: 1 else: 0)
+	body.append_int16_be(count16(result_formats.length())?)
+	for code in result_formats: body.append_int16_be(count16(code)?)
 	return framed(BIND, body.build())
 
 // Describes a statement (`STATEMENT`) or a portal (`PORTAL`).
