@@ -16,10 +16,9 @@ path=$work/package
 if command -v cygpath > /dev/null; then path=$(cygpath -m "$path"); fi
 case "$path" in /*) url="file://$path#v1.0.0" ;; *) url="file:///$path#v1.0.0" ;; esac
 cp -r "$here/ms.toml" "$here/src" "$work/app/"
-sed -i.bak "s|PACKAGE_URL|$url|" "$work/app/ms.toml"
 export MS_PACKAGE_CACHE="$work/cache"
 cd "$work/app"
-"$ms" fetch
+"$ms" add "${url%#*}" --tag "${url#*#}" --as @postgres --allow
 out=$("$ms" run)
 [ "$out" = "Value.Int(42)" ] || { echo "unexpected output: $out" >&2; exit 1; }
 echo "consumer ok"

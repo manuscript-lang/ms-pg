@@ -43,16 +43,22 @@ and on dispatch on Linux, macOS and Windows, with a `ms` built from the `manuscr
 
 ## As a dependency
 
-This repository is a Manuscript package: its root holds `ms.toml` and `src/`. Add it to a project's `ms.toml`, pinned to
-a full commit, and allow the effects it declares (`std.net.*`, `std.clock.read`, `std.random.read`):
+This repository is a Manuscript package: its root holds `ms.toml` and `src/`. Add it to a project with `ms add`, which
+installs it, pins it in `ms.lock`, and with `--allow` accepts the effects it declares (`std.net.*`, `std.clock.read`,
+`std.random.read`):
+
+```sh
+ms add https://github.com/manuscript-lang/ms-pg.git --sha <40-character commit> --allow
+```
+
+This writes the following to `ms.toml`; import with `import Config, open from "@pg/conn.ms"`.
 
 ```toml
 [dependencies]
-"@pg" = "https://github.com/manuscript-lang/ms-pg.git#<40-character commit>"
+"@pg" = { url = "https://github.com/manuscript-lang/ms-pg.git", sha = "<40-character commit>" }
 
 [effects]
 "@pg" = ["std.net.*", "std.clock.read", "std.random.read"]
 ```
 
-Then run `ms fetch`, which writes `ms.lock`, and import with `import Config, open from "@pg/conn.ms"`.
 `tests/consumer/run.sh` does this against a local git repository and runs a query.
