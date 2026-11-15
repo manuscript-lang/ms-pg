@@ -7,4 +7,4 @@ entry = "src/main.ms"
 "@postgres" = "PACKAGE_URL"
 
 [effects]
-"@postgres" = "std.net.* std.clock.read std.random.read"
+"@postgres" = ["std.net.*", "std.clock.read", "std.random.read"]
