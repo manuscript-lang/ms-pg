@@ -9,11 +9,11 @@ import (
 
 	md5_password, scram_start from "@pg/auth.ms",
 	Param,
-	Value,
 	decode_value,
 	encode_param,
-	encode_value,
-	is_binary_type from "@pg/value.ms",
+	TypeInfo,
+	is_binary_type from "@pg/decode.ms",
+	Value, encode_value from "@pg/value.ms",
 	Backend,
 	Field,
 	PORTAL,
@@ -116,6 +116,8 @@ export type Conn:
 	// Statements `query_cached` parsed, by SQL text.
 	statements: Map[String, Prepared]
 	statement_cache: Int
+	// Types registered by `load_types`, by OID.
+	types: Map[Int, TypeInfo]
 	trace: Bool
 	events: List[TraceEvent]
 	// NOTIFY messages that arrived while a statement was running, oldest first.
@@ -333,6 +335,7 @@ fn open_endpoint(config: Config) Conn!:
 		config.binary_results,
 		Map[String, Prepared](),
 		config.statement_cache,
+		Map[Int, TypeInfo](),
 		config.trace,
 		[],
 		[],
@@ -444,6 +447,7 @@ fn var Conn.pump(known: List[Field], emit: fn(List[Value]) Void!) Rows!:
 						fields[i].type_oid,
 						fields[i].format,
 						columns[i].clone(),
+						self.types,
 					)
 
 					if decoded.is_error():
@@ -577,7 +581,7 @@ fn var Conn.prepare(name: String, sql: String) Prepared!:
 			fn c: Field(
 				c.name.clone(),
 				c.type_oid,
-				if is_binary_type(c.type_oid): 1 else: 0,
+				if is_binary_type(c.type_oid, self.types): 1 else: 0,
 			)
 		)
 	return ok(Prepared(name.clone(), columns, param_oids, sql.clone()))
@@ -810,6 +814,7 @@ fn var Conn.send_batch_untraced(batch: Batch) List[Rows]!:
 						fields[i].type_oid,
 						fields[i].format,
 						columns[i].clone(),
+						self.types,
 					)
 
 					if decoded.is_error():
@@ -1080,3 +1085,35 @@ fn Rows.one() List[Value]!:
 	)
 
 	return ok(self.rows[0].clone())
+
+// Learns types the server defines by name, so their columns decode: enums (as `Text`),
+// composites (`Value.Composite`), domains (as their base type), ranges and multiranges
+// of any subtype, and `hstore`. Each name also registers its array type. List a
+// composite's field types too, or its fields stay text. Names are looked up as
+// `regtype` text, so schema-qualified names and quotes work.
+fn var Conn.load_types(names: List[String]) Void!:
+	sql := "select t.oid::int8, t.typtype::text, t.typbasetype::int8, t.typarray::int8, coalesce(r.rngsubtype, 0)::int8, coalesce(r.rngmultitypid, 0)::int8, coalesce((select array_agg(a.atttypid::int8 order by a.attnum) from pg_attribute a where a.attrelid = t.typrelid and a.attnum > 0 and not a.attisdropped), '{}'), t.typname from pg_type t left join pg_range r on r.rngtypid = t.oid where t.oid in (select to_regtype(n)::oid from unnest($1::text[]) n)"
+	rows := self.query(sql, [Value.Array(names.map(fn n: Value.Text(n.clone())))])?
+
+	for row in rows.rows:
+		oid := row[0].int().get(0)
+		kind := row[1].text().get("")
+		base := row[2].int().get(0)
+		array_oid := row[3].int().get(0)
+		subtype := row[4].int().get(0)
+		multi := row[5].int().get(0)
+		name := row[7].text().get("")
+		var fields = List[Int]()
+		for field in row[6].array().get([]): fields.append(field.int().get(0))
+
+		if kind == "e": self.types.add(oid, TypeInfo("enum"))
+		else if kind == "c": self.types.add(oid, TypeInfo("composite", 0, fields))
+		else if kind == "d": self.types.add(oid, TypeInfo("domain", base))
+		else if kind == "r": self.types.add(oid, TypeInfo("range", subtype))
+		else if name == "hstore": self.types.add(oid, TypeInfo("hstore"))
+
+		if multi > 0: self.types.add(multi, TypeInfo("multirange", subtype))
+		if array_oid > 0 and kind != "b" or array_oid > 0 and name == "hstore":
+			self.types.add(array_oid, TypeInfo("array", oid))
+
+	return ok()

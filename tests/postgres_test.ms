@@ -897,3 +897,85 @@ test "a pool streams rows from a pooled connection":
 	broken := expect_error(pool.each("select 1/0", [], fn row: refuse(row)))?
 	expect_equal(broken.kind, "22012")?
 	pool.close()?
+
+fn text_conn() Conn!:
+	cfg := config()?
+	return open(
+		Config(
+			host: cfg.host.clone(),
+			port: cfg.port,
+			user: cfg.user.clone(),
+			password: cfg.password.clone(),
+			binary_results: false,
+		)
+	)
+
+test "ranges, geometry, network, bit and time types agree in both formats":
+	var binary = open(config()?)?
+	var text = text_conn()?
+	sql := "select '[1,5)'::int4range, '(,3]'::int4range, 'empty'::int4range, '{[1,3),[5,7)}'::int4multirange, '[2026-01-01,2026-02-01)'::daterange, '[1.5,2.5]'::numrange, '[1,3]'::int8range, '(1,2)'::point, '((0,0),(1,1))'::box, '[(0,0),(1,1)]'::path, '((0,0),(1,1))'::path, '((0,0),(1,0),(1,1))'::polygon, '{1,2,3}'::line, '<(1,2),3>'::circle, '[(0,0),(1,1)]'::lseg, '10.1.2.3'::inet, '10.0.0.0/8'::cidr, '::1'::inet, '2001:db8::1/64'::inet, '1010'::bit(4), '10101'::varbit, '12:34:56.789'::time, '12:34:56+05:30'::timetz, '08:00:2b:01:02:03'::macaddr, array['[1,3)'::int4range, '[5,7)']"
+	typed := first_row(var binary, sql)?
+	expect_equal(typed, first_row(var text, sql)?)?
+	expect_equal(typed[0], Value.Range([Value.Int(1), Value.Int(5)], 1))?
+	expect_equal(typed[1], Value.Range([Value.Null, Value.Int(4)], 0))?
+	expect_equal(typed[2], Value.Range([Value.Null, Value.Null], 4))?
+	expect_equal(typed[3].array().get([]).length(), 2)?
+	expect_equal(typed[7], Value.Geometric("point", [1.0, 2.0], false))?
+	expect_equal(typed[13], Value.Geometric("circle", [1.0, 2.0, 3.0], false))?
+	expect_equal(typed[15], Value.Inet("10.1.2.3", 32))?
+	expect_equal(typed[16], Value.Inet("10.0.0.0", 8))?
+	expect_equal(typed[17], Value.Inet("::1", 128))?
+	expect_equal(typed[18], Value.Inet("2001:db8::1", 64))?
+	expect_equal(typed[19], Value.Bits(4, Bytes([160])))?
+	expect_equal(typed[20], Value.Bits(5, Bytes([168])))?
+	expect_equal(typed[21], Value.Time(45296789000))?
+	expect_equal(typed[22], Value.TimeTz(45296000000, 19800))?
+	expect_equal(typed[23], Value.Text("08:00:2b:01:02:03"))?
+	binary.close()?
+	text.close()?
+
+test "ranges and geometry go out as parameters":
+	var conn = open(config()?)?
+	rows := conn.query(
+		"select $1::int4range, $2::point, $3::inet, $4::bit(3), $5::time",
+		[
+			Value.Range([Value.Int(1), Value.Int(9)], 1),
+			Value.Geometric("point", [1.5, -2.0], false),
+			Value.Inet("192.168.0.1", 24),
+			Value.Bits(3, Bytes([160])),
+			Value.Time(3723000000),
+		],
+	)?
+	expect_equal(rows.rows[0][0], Value.Range([Value.Int(1), Value.Int(9)], 1))?
+	expect_equal(rows.rows[0][1], Value.Geometric("point", [1.5, -2.0], false))?
+	expect_equal(rows.rows[0][2], Value.Inet("192.168.0.1", 24))?
+	expect_equal(rows.rows[0][3], Value.Bits(3, Bytes([160])))?
+	expect_equal(rows.rows[0][4], Value.Time(3723000000))?
+	conn.close()?
+
+test "enums, composites, domains, ranges and hstore load by name":
+	var conn = open(config()?)?
+	void conn.simple("create extension if not exists hstore")?
+	void conn.simple("drop type if exists pg_pair, pg_mood cascade")?
+	void conn.simple("drop domain if exists pg_posint")?
+	void conn.simple("drop type if exists pg_span cascade")?
+	void conn.simple("create type pg_mood as enum ('sad', 'ok')")?
+	void conn.simple("create type pg_pair as (n int4, note text, mood pg_mood)")?
+	void conn.simple("create domain pg_posint as int4 check (value > 0)")?
+	void conn.simple("create type pg_span as range (subtype = int4)")?
+	conn.load_types(["pg_mood", "pg_pair", "pg_posint", "pg_span", "hstore"])?
+	sql := "select 'ok'::pg_mood, row(1, 'a b', 'sad')::pg_pair, 5::pg_posint, '[1,4)'::pg_span, 'a=>1, b=>NULL'::hstore, array['sad', 'ok']::pg_mood[], array[row(2, null, 'ok')]::pg_pair[]"
+	var binary_conn = conn
+	typed := first_row(var binary_conn, sql)?
+	expect_equal(typed[0], Value.Text("ok"))?
+	expect_equal(typed[1], Value.Composite([Value.Int(1), Value.Text("a b"), Value.Text("sad")]))?
+	expect_equal(typed[2], Value.Int(5))?
+	expect_equal(typed[3], Value.Range([Value.Int(1), Value.Int(4)], 1))?
+	expect_equal(typed[4], Value.Hstore(["a", "b"], [Value.Text("1"), Value.Null]))?
+	expect_equal(typed[5], Value.Array([Value.Text("sad"), Value.Text("ok")]))?
+	expect_equal(typed[6], Value.Array([Value.Composite([Value.Int(2), Value.Null, Value.Text("ok")])]))?
+	queried := binary_conn.query(sql, [])?
+	expect_equal(queried.rows[0], typed)?
+	void binary_conn.simple("drop type pg_pair, pg_mood, pg_span cascade")?
+	void binary_conn.simple("drop domain pg_posint")?
+	binary_conn.close()?
