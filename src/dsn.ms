@@ -4,7 +4,7 @@ import (
 	decode_component from "@std/net/url.ms",
 	Duration from "@std/time.ms",
 
-	Config from "@pg/conn.ms",
+	Config, Endpoint from "@pg/conn.ms",
 )
 
 fn invalid(what: String) Error:
@@ -14,10 +14,32 @@ fn invalid(what: String) Error:
 // this client reads as `verify-full`); `prefer`, `allow` and `require` are refused,
 // since each either falls back to plaintext or skips certificate verification.
 fn apply(var config: Config, key: String, value: String) Void!:
-	if key == "host": config.host = value.clone()
-	else if key == "port": config.port = value.parse_int().ok_or(
-		invalid(f"invalid port {value}")
-	)?
+	if key == "host":
+		hosts := value.split(",", none)
+		config.host = hosts[0].clone()
+		config.fallbacks = []
+		for i in 1..hosts.length(): config.fallbacks.append(
+			Endpoint(hosts[i].clone(), config.port)
+		)
+	else if key == "port":
+		ports := value.split(",", none)
+		config.port = ports[0].parse_int().ok_or(invalid(f"invalid port {value}"))?
+
+		for i in 0..config.fallbacks.length():
+			text := ports.get(i + 1, ports[0])
+			config.fallbacks[i].port = text.parse_int().ok_or(
+				invalid(f"invalid port {text}")
+			)?
+	else if key == "target_session_attrs":
+		known := [
+			"any", "read-write", "read-only", "primary", "standby", "prefer-standby"
+		]
+		if not known.contains(value): return error(
+			invalid(f"unknown target_session_attrs {value}")
+		)
+
+		config.target_session_attrs = value.clone()
+	else if key == "trace": config.trace = value == "true"
 	else if key == "user": config.user = value.clone()
 	else if key == "password": config.password = value.clone()
 	else if key == "dbname" or key == "database": config.database = value.clone()
@@ -47,6 +69,30 @@ fn unquote(text: String) String!:
 
 	return ok(trimmed.clone())
 
+// One `host`, `host:port`, `[v6]` or `[v6]:port` in a URL; port 0 means none given.
+fn parse_endpoint(host: String) Endpoint!:
+	var name = ""
+	var port = 0
+
+	if host.starts_with("["):
+		close := host.index_of("]").ok_or(invalid("unterminated IPv6 host"))?
+		name = host.slice(1, close)?
+
+		after := host.slice(close + 1, host.length())?
+
+		if after.starts_with(":"):
+			digits := after.slice(1, after.length())?
+			port = digits.parse_int().ok_or(invalid("invalid port"))?
+	else if colon := host.last_index_of(":"):
+		name = decode_component(host.slice(0, colon)?)?
+
+		digits := host.slice(colon + 1, host.length())?
+		port = digits.parse_int().ok_or(invalid("invalid port"))?
+	else:
+		name = decode_component(host)?
+
+	return ok(Endpoint(name, port))
+
 // `postgres://user:password@host:port/dbname?sslmode=verify-full&application_name=x`.
 // Every part is optional; a percent escape is decoded; a host in square brackets is an
 // IPv6 address; an empty host with `?host=/var/run/postgresql` names a Unix socket.
@@ -65,11 +111,11 @@ fn parse_url(rest: String) Config!:
 		path = body.slice(slash + 1, body.length())?
 		body = body.slice(0, slash)?
 
-	var host = body.clone()
+	var hosts = body.clone()
 
 	if at := body.last_index_of("@"):
 		login := body.slice(0, at)?
-		host = body.slice(at + 1, body.length())?
+		hosts = body.slice(at + 1, body.length())?
 
 		if colon := login.index_of(":"):
 			config.user = decode_component(login.slice(0, colon)?)?
@@ -77,21 +123,24 @@ fn parse_url(rest: String) Config!:
 		else:
 			config.user = decode_component(login)?
 
-	if host.starts_with("["):
-		close := host.index_of("]").ok_or(invalid("unterminated IPv6 host"))?
-		config.host = host.slice(1, close)?
+	var first = true
 
-		after := host.slice(close + 1, host.length())?
-		if after.starts_with(":"): apply(
-			var config,
-			"port",
-			after.slice(1, after.length())?,
-		)?
-	else if colon := host.last_index_of(":"):
-		if colon > 0: config.host = decode_component(host.slice(0, colon)?)?
-		apply(var config, "port", host.slice(colon + 1, host.length())?)?
-	else if not host.is_empty():
-		config.host = decode_component(host)?
+	for host in hosts.split(",", none):
+		if host.is_empty():
+			first = false
+			continue
+
+		endpoint := parse_endpoint(host)?
+
+		if first:
+			config.host = endpoint.host.clone()
+			if endpoint.port != 0: config.port = endpoint.port
+		else:
+			var other = endpoint.clone()
+			if other.port == 0: other.port = config.port
+			config.fallbacks.append(other)
+
+		first = false
 
 	if not path.is_empty(): config.database = decode_component(path)?
 

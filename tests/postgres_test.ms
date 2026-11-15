@@ -2,6 +2,7 @@ import (
 	Bytes from "@std/bytes.ms",
 	Promise, promise from "@std/concurrency/promise.ms",
 	collect, filter, fold, from_list, map, take from "@std/io/streams.ms",
+	parse_decimal from "@std/math/decimal.ms",
 	Connection, listen from "@std/net/net.ms",
 	TlsOptions from "@std/net/tls.ms",
 	environment from "@std/os/env.ms",
@@ -10,9 +11,27 @@ import (
 	Timestamp, sleep from "@std/time.ms",
 
 	md5_password from "@pg/auth.ms",
-	Batch, Config, Conn, Isolation, TxOptions, cancel, open from "@pg/conn.ms",
+	Batch,
+	Config,
+	Conn,
+	Endpoint,
+	Isolation,
+	TxOptions,
+	cancel,
+	open from "@pg/conn.ms",
 	config_from_env, parse_config from "@pg/dsn.ms",
-	Pool, Statement, start from "@pg/pool.ms",
+	LoMode,
+	Whence,
+	lo_close,
+	lo_create,
+	lo_open,
+	lo_read,
+	lo_seek,
+	lo_tell,
+	lo_truncate,
+	lo_unlink,
+	lo_write from "@pg/large.ms",
+	Pool, PoolOptions, Statement, start, start_with from "@pg/pool.ms",
 	stream from "@pg/stream.ms",
 	Value from "@pg/value.ms",
 	Backend, DATA_ROW, decode_message from "@pg/wire.ms",
@@ -300,7 +319,7 @@ test "binary results decode timestamps and dates":
 	expect_equal(row[4], Value.Text("infinity"))?
 	conn.close()?
 
-test "binary and text results agree, and numeric stays text":
+test "binary and text results agree":
 	var binary = open(config()?)?
 	cfg := config()?
 	var text = open(
@@ -316,7 +335,7 @@ test "binary and text results agree, and numeric stays text":
 	expect_equal(first_row(var binary, sql)?, first_row(var text, sql)?)?
 
 	row := first_row(var binary, sql)?
-	expect_equal(row[3], Value.Text("1.25"))?
+	expect_equal(row[3].decimal().get(parse_decimal("0")?).to_string(), "1.25")?
 
 	// NaN never equals itself, so compare it by `is_nan` in both formats.
 	nan := "select 'NaN'::float8, 'Infinity'::float8"
@@ -591,4 +610,253 @@ test "copy from loads rows from a stream and copy to reads them back":
 
 	count := conn.query("select count(*) from cp", [])?
 	expect_equal(count.rows[0][0].int().get(0), 3)?
+	conn.close()?
+
+test "numeric, json, interval and arrays decode the same in both formats":
+	var binary = open(config()?)?
+	cfg := config()?
+	var text = open(
+		Config(
+			host: cfg.host.clone(),
+			port: cfg.port,
+			user: cfg.user.clone(),
+			password: cfg.password.clone(),
+			binary_results: false,
+		)
+	)?
+	sql := "select 12345678901234567890.0012::numeric, (-0.000123)::numeric, 0::numeric, 100000::numeric, '{\"a\": [1, 2]}'::jsonb, '{\"b\": 1}'::json, '1 year 2 mons 3 days 04:05:06.7'::interval, '-1 days -00:00:01'::interval, '{1,2,NULL}'::int4[], '{{\"a b\",\"c\\\"d\"},{e,NULL}}'::text[], '{}'::int8[], 'NaN'::numeric"
+	typed := first_row(var binary, sql)?
+	expect_equal(typed, first_row(var text, sql)?)?
+	expect_equal(
+		typed[0].decimal().get(parse_decimal("0")?).to_string(),
+		"12345678901234567890.0012",
+	)?
+	expect_equal(typed[1].decimal().get(parse_decimal("0")?).to_string(), "-0.000123")?
+	expect_equal(typed[3].decimal().get(parse_decimal("0")?).to_string(), "100000")?
+	expect_equal(typed[4].json().get(""), "{\"a\": [1, 2]}")?
+	expect_equal(typed[6], Value.Interval(14, 3, 14706700000))?
+	expect_equal(typed[7], Value.Interval(0, -1, -1000000))?
+	expect_equal(typed[8], Value.Array([Value.Int(1), Value.Int(2), Value.Null]))?
+
+	nested := typed[9].array().get([])
+	expect_equal(nested[0], Value.Array([Value.Text("a b"), Value.Text("c\"d")]))?
+	expect_equal(nested[1], Value.Array([Value.Text("e"), Value.Null]))?
+	expect_equal(typed[10], Value.Array([]))?
+	expect_equal(typed[11], Value.Text("NaN"))?
+	binary.close()?
+	text.close()?
+
+test "arrays, json, decimals and intervals go out as parameters":
+	var conn = open(config()?)?
+	rows := conn.query(
+		"select $1::int4[], $2::jsonb, $3::numeric, $4::interval",
+		[
+			Value.Array([Value.Int(1), Value.Null, Value.Int(3)]),
+			Value.Json("{\"k\": true}"),
+			Value.Decimal(parse_decimal("1.50")?),
+			Value.Interval(1, 2, 3),
+		],
+	)?
+	expect_equal(rows.rows[0][0], Value.Array([Value.Int(1), Value.Null, Value.Int(3)]))?
+	expect_equal(rows.rows[0][1].json().get(""), "{\"k\": true}")?
+	expect_equal(rows.rows[0][2].decimal().get(parse_decimal("0")?).to_string(), "1.5")?
+	expect_equal(rows.rows[0][3], Value.Interval(1, 2, 3))?
+	conn.close()?
+
+test "a cached statement sends binary parameters and is reused":
+	var conn = open(config()?)?
+	sql := "select $1::int8 + $2::int4, $3::bytea, $4::text, $5::uuid, $6::timestamptz, $7::date, $8::bool, $9::float8, $10::int2"
+	stamp := Timestamp(seconds: 1700000000, nanos: 123456000)
+	args := [
+		Value.Int(1),
+		Value.Int(2),
+		Value.Bytes(Bytes([0, 255, 7])),
+		Value.Text("héllo"),
+		Value.Text("123e4567-e89b-12d3-a456-426614174000"),
+		Value.Timestamp(stamp.clone()),
+		Value.Date(20000),
+		Value.Bool(true),
+		Value.Float(2.5),
+		Value.Int(7),
+	]
+	first := conn.query_cached(sql, args)?
+	second := conn.query_cached(sql, args)?
+	expect_equal(second.rows, first.rows)?
+	expect_equal(first.rows[0][0], Value.Int(3))?
+	expect_equal(first.rows[0][2], Value.Text("héllo"))?
+	expect_equal(first.rows[0][1], Value.Bytes(Bytes([0, 255, 7])))?
+	expect_equal(first.rows[0][3], Value.Text("123e4567-e89b-12d3-a456-426614174000"))?
+	expect_equal(first.rows[0][4], Value.Timestamp(stamp))?
+	expect_equal(first.rows[0][5], Value.Date(20000))?
+	expect_equal(conn.statements.length(), 1)?
+
+	// An out of range integer is sent as text, so the server reports the error.
+	failure := expect_error(conn.query_cached("select $1::int2", [Value.Int(100000)]))?
+	expect_equal(failure.kind, "22003")?
+
+	prepared := conn.prepare("gone", "select 1")?
+	conn.deallocate(prepared)?
+	void expect_error(conn.run(prepared, []))?
+	conn.close()?
+
+test "a pool runs a transaction on one connection and rolls back on failure":
+	var setup = open(config()?)?
+	void setup.simple("drop table if exists pool_tx")?
+	void setup.simple("create table pool_tx (n int)")?
+
+	var pool = start(config()?, 2)?
+	done := pool.transaction(
+		[
+			Statement("insert into pool_tx values (1)"),
+			Statement("insert into pool_tx values (2)"),
+		]
+	)?
+	expect_equal(done.length(), 2)?
+	void expect_error(
+		pool.transaction(
+			[
+				Statement("insert into pool_tx values (3)"),
+				Statement("select 1/0"),
+			]
+		)
+	)?
+
+	count := pool.query("select count(*) from pool_tx")?
+	expect_equal(count.rows[0][0].int().get(0), 2)?
+
+	piped := pool.batch([Statement("select 1"), Statement("select 2")])?
+	expect_equal(piped[1].rows[0][0].int().get(0), 2)?
+	pool.ping()?
+	pool.close()?
+	void setup.simple("drop table pool_tx")?
+	setup.close()?
+
+test "a pool replaces a connection past its lifetime and one that was killed":
+	var pool = start_with(config()?, 1, PoolOptions(max_lifetime: 1.milliseconds()))?
+	first := pool.query("select pg_backend_pid()")?
+	sleep(20.milliseconds()).wait()?
+
+	second := pool.query("select pg_backend_pid()")?
+	expect_true(first.rows[0][0] != second.rows[0][0])?
+	pool.close()?
+
+	var killed = start(config()?, 1)?
+	void killed.query("select pg_terminate_backend(pg_backend_pid())")
+
+	var recovered = false
+
+	for _attempt in 0..3:
+		if killed.query("select 1").is_ok():
+			recovered = true
+			break
+
+	expect_true(recovered)?
+	killed.close()?
+
+test "connection strings list several hosts":
+	parsed := parse_config(
+		"postgres://a:5001,b,[::1]:5003/db?target_session_attrs=read-write"
+	)?
+	expect_equal(parsed.host, "a")?
+	expect_equal(parsed.port, 5001)?
+	expect_equal(parsed.fallbacks.length(), 2)?
+	expect_equal(parsed.fallbacks[0].host, "b")?
+	expect_equal(parsed.fallbacks[0].port, 5001)?
+	expect_equal(parsed.fallbacks[1].host, "::1")?
+	expect_equal(parsed.fallbacks[1].port, 5003)?
+	expect_equal(parsed.target_session_attrs, "read-write")?
+
+	words := parse_config("host=a,b port=1,2 dbname=x")?
+	expect_equal(words.fallbacks[0].port, 2)?
+	void expect_error(parse_config("host=a target_session_attrs=bogus"))?
+
+test "open falls back to the next server and honours the wanted kind":
+	good := config()?
+	var down = good.clone()
+	down.host = "127.0.0.1"
+	down.port = 1
+	down.fallbacks = [Endpoint(good.host.clone(), good.port)]
+
+	var conn = open(down)?
+	probe := conn.query("select 1", [])?
+	expect_equal(probe.rows[0][0].int().get(0), 1)?
+	conn.close()?
+
+	var writer = good.clone()
+	writer.target_session_attrs = "read-write"
+
+	var primary = open(writer)?
+	primary.close()?
+
+	var standby = good.clone()
+	standby.target_session_attrs = "standby"
+	void expect_error(open(standby))?
+
+	var preferred = good.clone()
+	preferred.target_session_attrs = "prefer-standby"
+
+	var fallback = open(preferred)?
+	fallback.close()?
+
+test "trace events record each statement":
+	var settings = config()?
+	settings.trace = true
+
+	var conn = open(settings)?
+	void conn.take_trace()
+	void conn.query("select $1::int4", [Value.Int(1)])?
+	void expect_error(conn.simple("select 1/0"))?
+
+	events := conn.take_trace()
+	expect_equal(events.length(), 2)?
+	expect_equal(events[0].kind, "query")?
+	expect_true(events[0].failure.is_none())?
+	expect_equal(events[1].sql, "select 1/0")?
+	expect_equal(events[1].failure, "22012")?
+	expect_true(conn.take_trace().is_empty())?
+	conn.close()?
+
+test "row helpers pick columns and single rows":
+	var conn = open(config()?)?
+	rows := conn.query(
+		"select 1 as a, 'x' as b union all select 2, 'y' order by 1",
+		[],
+	)?
+	expect_equal(rows.column_index("b"), 1)?
+	expect_equal(rows.column("a")?, [Value.Int(1), Value.Int(2)])?
+	expect_equal(rows.maps()[1].get_or("b", Value.Null), Value.Text("y"))?
+
+	many := expect_error(rows.one())?
+	expect_equal(many.kind, "ETOOMANY")?
+
+	none := conn.query("select 1 where false", [])?
+	missing := expect_error(none.one())?
+	expect_equal(missing.kind, "ENOROWS")?
+
+	single := conn.query("select 5", [])?
+	only := single.one()?
+	expect_equal(only[0], Value.Int(5))?
+	conn.ping()?
+	expect_true(conn.parameter("server_version").is_some())?
+	expect_equal(conn.in_transaction(), false)?
+	conn.close()?
+
+test "large objects are written, read, sought and removed":
+	var conn = open(config()?)?
+
+	void conn.transaction(
+		fn(var c: Conn):
+			oid := lo_create(var c, 0)?
+			fd := lo_open(var c, oid, LoMode.ReadWrite)?
+			expect_equal(lo_write(var c, fd, Bytes([104, 101, 108, 108, 111]))?, 5)?
+			expect_equal(lo_seek(var c, fd, 1, Whence.Start)?, 1)?
+			expect_equal(lo_read(var c, fd, 3)?, Bytes([101, 108, 108]))?
+			expect_equal(lo_tell(var c, fd)?, 4)?
+			lo_truncate(var c, fd, 2)?
+			expect_equal(lo_seek(var c, fd, 0, Whence.End)?, 2)?
+			lo_close(var c, fd)?
+			lo_unlink(var c, oid)?
+			return ok(0)
+	)?
+
 	conn.close()?

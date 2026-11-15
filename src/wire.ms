@@ -165,18 +165,21 @@ export fn parse(name: String, sql: String, oids: List[Int]) Bytes!:
 	for oid in oids: body.append_int32_be(size32(oid)?)
 	return framed(PARSE, body.build())
 
-// Bind with text-format parameters (none means NULL). `result_formats` holds one format
-// code per result column (0 text, 1 binary); an empty list asks for all text.
+// Bind with parameters (none means NULL). `param_formats` holds one format code per
+// parameter and `result_formats` one per result column (0 text, 1 binary); an empty
+// list asks for all text.
 export fn bind(
 	portal: String,
 	name: String,
 	params: List[Bytes?],
+	param_formats: List[Int],
 	result_formats: List[Int],
 ) Bytes!:
 	var body = BytesBuilder()
 	cstring(var body, portal)
 	cstring(var body, name)
-	body.append_int16_be(0)
+	body.append_int16_be(count16(param_formats.length())?)
+	for code in param_formats: body.append_int16_be(count16(code)?)
 	body.append_int16_be(count16(params.length())?)
 
 	for param in params:

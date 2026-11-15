@@ -5,10 +5,15 @@ import (
 	from_list from "@std/io/streams.ms",
 	Connection, connect, connect_unix, start_tls from "@std/net/net.ms",
 	TlsOptions from "@std/net/tls.ms",
-	Duration from "@std/time.ms",
+	Duration, Instant, monotonic from "@std/time.ms",
 
 	md5_password, scram_start from "@pg/auth.ms",
-	Value, decode_value, encode_value, is_binary_type from "@pg/value.ms",
+	Param,
+	Value,
+	decode_value,
+	encode_param,
+	encode_value,
+	is_binary_type from "@pg/value.ms",
 	Backend,
 	Field,
 	PORTAL,
@@ -16,6 +21,7 @@ import (
 	STATUS_IDLE,
 	bind,
 	cancel_request,
+	close_statement,
 	copy_data,
 	copy_done,
 	copy_fail,
@@ -33,6 +39,11 @@ import (
 	sync,
 	terminate from "@pg/wire.ms",
 )
+
+// Another server to try when the first is down or is not the kind asked for.
+export type Endpoint:
+	host: String
+	port: Int = 5432
 
 // A host that starts with `/` is a Unix socket directory (`/var/run/postgresql`), and
 // the socket is `.s.PGSQL.<port>` inside it. TLS does not apply to a Unix socket.
@@ -59,6 +70,17 @@ export type Config:
 	// Extra server settings sent at startup, such as `search_path` or
 	// `statement_timeout`.
 	params: Map[String, String] = Map[String, String]()
+	// How many statements `query_cached` keeps prepared before it clears them all. Zero
+	// turns the cache off, and every call parses again.
+	statement_cache: Int = 512
+	// Servers tried in order after `host` and `port`, as in a connection string with
+	// `host=a,b`.
+	fallbacks: List[Endpoint] = []
+	// Which server `open` accepts: `any`, `read-write`, `read-only`, `primary`,
+	// `standby` or `prefer-standby` (a standby when one answers, otherwise any).
+	target_session_attrs: String = "any"
+	// Record a `TraceEvent` for each statement; read them with `take_trace`.
+	trace: Bool = false
 
 // The result of one statement.
 export type Rows:
@@ -91,8 +113,21 @@ export type Conn:
 	// `STATUS_IN_TRANSACTION` or `STATUS_FAILED`.
 	status: UInt8
 	binary_results: Bool
+	// Statements `query_cached` parsed, by SQL text.
+	statements: Map[String, Prepared]
+	statement_cache: Int
+	trace: Bool
+	events: List[TraceEvent]
 	// NOTIFY messages that arrived while a statement was running, oldest first.
 	notifications: List[Notification]
+
+// One finished statement, kept when `Config.trace` is on: what ran (`query`, `simple`,
+// `run` or `batch`), the SQL, how long it took and the error kind if it failed.
+export type TraceEvent:
+	kind: String
+	sql: String
+	elapsed: Duration
+	failure: String?
 
 // One NOTIFY: the sending backend's process id, the channel and the payload.
 export type Notification:
@@ -231,8 +266,61 @@ export fn cancel(config: Config, pid: Int, secret: Int) Void!:
 	net.output.write(cancel_request(pid, secret)?)?
 	return net.close()
 
-// Connects, authenticates, and returns a connection ready for queries.
+fn var Conn.attrs_match(wanted: String) Bool!:
+	if wanted == "any": return ok(true)
+
+	if wanted == "read-write" or wanted == "read-only":
+		mode := self.simple("show transaction_read_only")?
+		off := mode.rows[0][0].text().get("") == "off"
+		return ok(off == (wanted == "read-write"))
+
+	recovery := self.simple("select pg_is_in_recovery()")?
+	standby := recovery.rows[0][0].bool().get(false)
+	return ok(standby == (wanted == "standby" or wanted == "prefer-standby"))
+
+// Opens one server of `config` and checks it is the kind asked for.
+fn open_server(config: Config, wanted: String) Conn!:
+	var conn = open_endpoint(config)?
+	if conn.attrs_match(wanted)?: return ok(conn)
+
+	void conn.close()
+	return error(
+		Error(
+			f"postgres: {config.host}:{config.port} is not {wanted}",
+			kind: "ENOTSUP",
+		)
+	)
+
+// Connects, authenticates, and returns a connection ready for queries. Servers are
+// tried in order (`host`, then `fallbacks`); the first that answers and matches
+// `target_session_attrs` wins, and the last failure is returned when none does.
 export fn open(config: Config) Conn!:
+	var servers = [Endpoint(config.host.clone(), config.port)]
+	for server in config.fallbacks: servers.append(server.clone())
+
+	var wanted = config.target_session_attrs.clone()
+	var passes = 1
+	if wanted == "prefer-standby": passes = 2
+
+	var last = Error("postgres: no server to try", kind: "EINVAL")
+
+	for pass in 0..passes:
+		if pass == 1: wanted = "any"
+
+		for server in servers:
+			var attempt = config.clone()
+			attempt.host = server.host.clone()
+			attempt.port = server.port
+			attempt.fallbacks = []
+
+			opened := open_server(attempt, wanted)
+			if opened.is_ok(): return opened
+
+			last = opened.err().clone()
+
+	return error(last)
+
+fn open_endpoint(config: Config) Conn!:
 	var net = dial(config)?
 	var conn = Conn(
 		net,
@@ -243,6 +331,10 @@ export fn open(config: Config) Conn!:
 		0,
 		STATUS_IDLE,
 		config.binary_results,
+		Map[String, Prepared](),
+		config.statement_cache,
+		config.trace,
+		[],
 		[],
 	)
 	var parameters = config.params.clone()
@@ -386,6 +478,12 @@ fn var Conn.collect(known: List[Field]) Rows!:
 // Runs a statement with no parameters over the simple protocol; may hold several
 // statements.
 fn var Conn.simple(sql: String) Rows!:
+	started := monotonic()
+	result := self.simple_untraced(sql)
+	self.record("simple", sql, started, result.error())
+	return result
+
+fn var Conn.simple_untraced(sql: String) Rows!:
 	self.send(query(sql)?)?
 	return self.collect([])
 
@@ -398,7 +496,7 @@ fn var Conn.run_streaming(
 ) Rows!:
 	var out = BytesBuilder()
 	out.append_bytes(parse("", sql, [])?)
-	out.append_bytes(bind("", "", params.map(fn p: encode_value(p)), [])?)
+	out.append_bytes(bind("", "", params.map(fn p: encode_value(p)), [], [])?)
 	out.append_bytes(describe(PORTAL, "")?)
 	out.append_bytes(execute("", 0)?)
 	out.append_bytes(sync()?)
@@ -407,9 +505,15 @@ fn var Conn.run_streaming(
 
 // Runs one statement with parameters in a single round trip.
 fn var Conn.query(sql: String, params: List[Value]) Rows!:
+	started := monotonic()
+	result := self.query_untraced(sql, params)
+	self.record("query", sql, started, result.error())
+	return result
+
+fn var Conn.query_untraced(sql: String, params: List[Value]) Rows!:
 	var out = BytesBuilder()
 	out.append_bytes(parse("", sql, [])?)
-	out.append_bytes(bind("", "", params.map(fn p: encode_value(p)), [])?)
+	out.append_bytes(bind("", "", params.map(fn p: encode_value(p)), [], [])?)
 	out.append_bytes(describe(PORTAL, "")?)
 	out.append_bytes(execute("", 0)?)
 	out.append_bytes(sync()?)
@@ -437,6 +541,9 @@ export type Prepared:
 	name: String
 	// The result columns, each with the format code the statement requests for it.
 	columns: List[Field]
+	// The type OID of each parameter, which picks text or binary encoding in `run`.
+	param_oids: List[Int]
+	sql: String
 
 // Parses `sql` under `name` and learns its result columns.
 fn var Conn.prepare(name: String, sql: String) Prepared!:
@@ -447,6 +554,7 @@ fn var Conn.prepare(name: String, sql: String) Prepared!:
 	self.send(out.build())?
 
 	var columns = List[Field]()
+	var param_oids = List[Int]()
 	var failure: Error? = none
 
 	while true:
@@ -454,6 +562,7 @@ fn var Conn.prepare(name: String, sql: String) Prepared!:
 
 		match message:
 			Backend.RowDescription(found): columns = found.clone()
+			Backend.ParameterDescription(oids): param_oids = oids.clone()
 			Backend.ErrorResponse(found):
 				if failure.is_none(): failure = server_error(found)
 			Backend.ReadyForQuery(status):
@@ -471,14 +580,34 @@ fn var Conn.prepare(name: String, sql: String) Prepared!:
 				if is_binary_type(c.type_oid): 1 else: 0,
 			)
 		)
-	return ok(Prepared(name.clone(), columns))
+	return ok(Prepared(name.clone(), columns, param_oids, sql.clone()))
 
 // Runs a prepared statement: bind, execute and sync in one round trip.
 fn var Conn.run(statement: Prepared, params: List[Value]) Rows!:
+	started := monotonic()
+	result := self.run_untraced(statement, params)
+	self.record("run", statement.sql, started, result.error())
+	return result
+
+fn var Conn.run_untraced(statement: Prepared, params: List[Value]) Rows!:
 	var out = BytesBuilder()
 	formats := statement.columns.map(fn c: c.format)
+	var encoded = List[Param]()
+
+	for i in 0..params.length():
+		if self.binary_results and i < statement.param_oids.length():
+			encoded.append(encode_param(statement.param_oids[i], params[i]))
+		else:
+			encoded.append(Param(encode_value(params[i]), 0))
+
 	out.append_bytes(
-		bind("", statement.name, params.map(fn p: encode_value(p)), formats)?
+		bind(
+			"",
+			statement.name,
+			encoded.map(fn p: p.data.clone()),
+			encoded.map(fn p: p.format),
+			formats,
+		)?
 	)
 	out.append_bytes(execute("", 0)?)
 	out.append_bytes(sync()?)
@@ -632,11 +761,25 @@ fn Batch.length() Int:
 // and the error is returned, with none of the changes kept. All results use the text
 // format.
 fn var Conn.send_batch(batch: Batch) List[Rows]!:
+	started := monotonic()
+	result := self.send_batch_untraced(batch)
+	self.record("batch", batch.sql.join("; "), started, result.error())
+	return result
+
+fn var Conn.send_batch_untraced(batch: Batch) List[Rows]!:
 	var out = BytesBuilder()
 
 	for i in 0..batch.length():
 		out.append_bytes(parse("", batch.sql[i], [])?)
-		out.append_bytes(bind("", "", batch.params[i].map(fn p: encode_value(p)), [])?)
+		out.append_bytes(
+			bind(
+				"",
+				"",
+				batch.params[i].map(fn p: encode_value(p)),
+				[],
+				[],
+			)?
+		)
 		out.append_bytes(describe(PORTAL, "")?)
 		out.append_bytes(execute("", 0)?)
 
@@ -840,3 +983,100 @@ fn var Conn.copy_to(sql: String) Rows!:
 		rows.append(line.split("\t", none).map(fn field: unescape_copy(field)))
 
 	return ok(Rows([], rows, tag))
+
+// Frees a prepared statement on the server.
+fn var Conn.deallocate(statement: Prepared) Void!:
+	var out = BytesBuilder()
+	out.append_bytes(close_statement(statement.name)?)
+	out.append_bytes(sync()?)
+	self.send(out.build())?
+	void self.collect([])?
+	return ok()
+
+// Runs `sql` through a per-connection statement cache: the first call parses and names
+// the statement, later calls with the same text reuse it and send binary parameters
+// and results. When the cache is full, it is cleared with DEALLOCATE ALL.
+fn var Conn.query_cached(sql: String, params: List[Value]) Rows!:
+	if self.statement_cache <= 0: return self.query(sql, params)
+
+	if known := self.statements.get(sql):
+		reuse := known.clone()
+		return self.run(reuse, params)
+
+	if self.statements.length() >= self.statement_cache:
+		void self.simple("DEALLOCATE ALL")?
+		self.statements.clear()
+
+	name := f"ms_{self.statements.length()}"
+	prepared := self.prepare(name, sql)?
+	self.statements.add(sql.clone(), prepared.clone())
+	return self.run(prepared, params)
+
+// The events recorded since the last call, oldest first. Empty unless `Config.trace`.
+fn var Conn.take_trace() List[TraceEvent]:
+	taken := self.events.clone()
+	self.events = []
+	return taken
+
+fn var Conn.record(kind: String, sql: String, started: Instant, failure: Error?) Void:
+	if not self.trace: return
+
+	var failure_kind: String? = none
+	if f := failure: failure_kind = f.kind.get("error")
+	self.events.append(
+		TraceEvent(
+			kind,
+			sql.clone(),
+			monotonic().difference(started),
+			failure_kind,
+		)
+	)
+
+// Round-trips to the server; an error means the connection is unusable.
+fn var Conn.ping() Void!:
+	void self.simple("")?
+	return ok()
+
+// A server setting the server reported, such as `server_version` or `TimeZone`.
+fn Conn.parameter(name: String) String?:
+	return self.parameters.get(name).map(fn v: v.clone())
+
+fn Conn.in_transaction() Bool:
+	return self.status != STATUS_IDLE
+
+// The index of a result column by name.
+fn Rows.column_index(name: String) Int?:
+	return self.columns.index_of(name)
+
+// One column of every row.
+fn Rows.column(name: String) List[Value]!:
+	index := self.column_index(
+		name
+	).ok_or(Error(f"postgres: no column {name}", kind: "ENOENT"))?
+	return ok(self.rows.map(fn row: row[index].clone()))
+
+// Every row as a map from column name to value, like pgx's `RowToMap`.
+fn Rows.maps() List[Map[String, Value]]:
+	var out = List[Map[String, Value]]()
+
+	for row in self.rows:
+		var entry = Map[String, Value]()
+		for i in 0..self.columns.length(): entry.add(
+			self.columns[i].clone(),
+			row[i].clone(),
+		)
+		out.append(entry)
+
+	return out
+
+// The only row, like pgx's `QueryRow`: an error with kind `ENOROWS` when there is none
+// and `ETOOMANY` when there are several.
+fn Rows.one() List[Value]!:
+	if self.rows.is_empty(): return error(
+		Error("postgres: no rows in result set", kind: "ENOROWS")
+	)
+	if self.rows.length() > 1: return error(
+		Error("postgres: more than one row", kind: "ETOOMANY")
+	)
+
+	return ok(self.rows[0].clone())
