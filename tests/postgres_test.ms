@@ -354,6 +354,30 @@ test "binary results decode timestamps and dates":
 	expect_equal(row[4], Value.Text("infinity"))?
 	conn.close()?
 
+test "timestamps and dates outside year 1 to 9999 read the same in text and binary":
+	var binary = open(config()?)?
+	cfg := config()?
+	var text = open(
+		Config(
+			host: cfg.host.clone(),
+			port: cfg.port,
+			user: cfg.user.clone(),
+			password: cfg.password.clone(),
+			binary_results: false,
+		)
+	)?
+	sql := "select '0044-03-15 12:00:00.5 BC'::timestamp, '294276-12-31 23:59:59.999999'::timestamp, '4713-01-01 BC'::date, '0001-01-01'::date, '9999-12-31'::date, '5874897-12-31'::date, d, (d - date '1970-01-01')::int8 from (values ('0001-02-28'::date), ('0004-02-29'), ('1900-03-01'), ('2000-02-29'), ('2100-03-01'), ('9999-12-31'), ('0100-03-01 BC'::date)) as t(d)"
+	from_binary := binary.query_cached(sql, [])?
+	from_text := text.simple(sql)?
+	expect_equal(from_binary.rows[0][0], Value.Text("0044-03-15 12:00:00.5 BC"))?
+	expect_equal(from_binary.rows[0][1], Value.Text("294276-12-31 23:59:59.999999"))?
+	expect_equal(from_binary.rows[0][2], Value.Date(-2440550))?
+	for i in 0..from_binary.rows.length():
+		expect_equal(from_text.rows[i], from_binary.rows[i])?
+		expect_equal(from_text.rows[i][6], Value.Date(from_text.rows[i][7].int().get(0)))?
+	binary.close()?
+	text.close()?
+
 test "binary and text results agree":
 	var binary = open(config()?)?
 	cfg := config()?
