@@ -77,17 +77,73 @@ fn rfc3339(text: String) String:
 
 	return f"{joined}Z"
 
+// Unix seconds of 0001-01-01T00:00:00Z and 9999-12-31T23:59:59Z: the range of `Timestamp`.
+EARLIEST_SECONDS: Int := -62135596800
+LATEST_SECONDS: Int := 253402300799
+
+// Days since 1970-01-01 of a proleptic Gregorian date. The year is astronomical: 1 BC is year 0.
+fn days_from_civil(year: Int, month: Int, day: Int) Int:
+	y := if month <= 2: year - 1 else: year
+	era := if y >= 0: y / 400 else: (y - 399) / 400
+	year_of_era := y - era * 400
+	shifted := if month > 2: month - 3 else: month + 9
+	day_of_year := (153 * shifted + 2) / 5 + day - 1
+	day_of_era := year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
+	return era * 146097 + day_of_era - 719468
+
+type Civil:
+	year: Int
+	month: Int
+	day: Int
+
+// The proleptic Gregorian date `days` after 1970-01-01.
+fn civil_from_days(days: Int) Civil:
+	z := days + 719468
+	era := if z >= 0: z / 146097 else: (z - 146096) / 146097
+	day_of_era := z - era * 146097
+	year_of_era := (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365
+	day_of_year := day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100)
+	shifted := (5 * day_of_year + 2) / 153
+	day := day_of_year - (153 * shifted + 2) / 5 + 1
+	month := if shifted < 10: shifted + 3 else: shifted - 9
+	year := year_of_era + era * 400 + (if month <= 2: 1 else: 0)
+	return Civil(year: year, month: month, day: day)
+
+// `true` when the server's timestamp text names a year `Timestamp` cannot hold: before
+// year 1 (written with a trailing ` BC`) or after 9999 (a year of five digits or more).
+fn beyond_timestamps(text: String) Bool:
+	if text.ends_with(" BC"): return true
+
+	return (text.index_of("-").get(0)) > 4
+
 fn decode_text_timestamp(text: String) Value!:
 	if text == "infinity" or text == "-infinity": return ok(Value.Text(text))
+
+	// Like the binary format, a moment outside year 1 to 9999 keeps the server's text.
+	if beyond_timestamps(text): return ok(Value.Text(text))
 
 	stamp := parse_timestamp(rfc3339(text)).map_error(fn _e: bad("timestamp", text))?
 	return ok(Value.Timestamp(stamp))
 
+// A `date` as days since 1970-01-01, for every year the server accepts, BC included.
 fn decode_text_date(text: String) Value!:
 	if text == "infinity" or text == "-infinity": return ok(Value.Text(text))
 
-	stamp := parse_timestamp(f"{text}T00:00:00Z").map_error(fn _e: bad("date", text))?
-	return ok(Value.Date(stamp.seconds / 86400))
+	before_common_era := text.ends_with(" BC")
+	body := if before_common_era: text.slice(0, text.length() - 3).get("") else: text.clone()
+	parts := body.split("-")
+	if parts.length() != 3: return error(bad("date", text))
+
+	label := parts[0].parse_int()
+	month := parts[1].parse_int()
+	day := parts[2].parse_int()
+	if label.is_none() or month.is_none() or day.is_none(): return error(bad("date", text))
+
+	year := if before_common_era: 1 - label.get() else: label.get()
+	if month.get() < 1 or month.get() > 12 or day.get() < 1 or day.get() > 31:
+		return error(bad("date", text))
+
+	return ok(Value.Date(days_from_civil(year, month.get(), day.get())))
 
 // The element type of an array type, by OID; none for any other type.
 fn element_of(type_oid: Int) Int?:
@@ -669,8 +725,25 @@ fn expect_size(type_name: String, bytes: Bytes, size: Int) Void!:
 	if bytes.length() != size: return error(size_error(type_name, bytes.length()))
 	return ok()
 
+fn two_digits(value: Int) String:
+	return value.to_string_radix(10).pad_start(2, "0")
+
+// A moment outside year 1 to 9999 as the server's text without a zone: `YYYY-MM-DD
+// HH:MM:SS[.ffffff]`, with ` BC` before year 1 and more digits after 9999.
+fn timestamp_text(seconds: Int, fraction: Int) String:
+	days := if seconds >= 0: seconds / 86400 else: (seconds - 86399) / 86400
+	rest := seconds - days * 86400
+	civil := civil_from_days(days)
+	label := if civil.year > 0: civil.year else: 1 - civil.year
+	era := if civil.year > 0: "" else: " BC"
+	micros := if fraction == 0: "" else: "." + fraction.to_string_radix(10).pad_start(6, "0").trim_end_chars("0")
+	clock := f"{two_digits(rest / 3600)}:{two_digits(rest % 3600 / 60)}:{two_digits(rest % 60)}"
+	year := label.to_string_radix(10).pad_start(4, "0")
+	return f"{year}-{two_digits(civil.month)}-{two_digits(civil.day)} {clock}{micros}{era}"
+
 // Microseconds since 2000-01-01 as a timestamp. The infinities PostgreSQL stores as the
-// extreme integers read as the text the server sends for them.
+// extreme integers read as the text the server sends for them, as does a moment outside
+// the years a `Timestamp` holds.
 fn decode_timestamp(micros: Int) Value:
 	if micros == 9223372036854775807: return Value.Text("infinity")
 	if micros == -9223372036854775807 - 1: return Value.Text("-infinity")
@@ -679,6 +752,9 @@ fn decode_timestamp(micros: Int) Value:
 	if fraction < 0: fraction += 1000000
 
 	seconds := (micros - fraction) / 1000000 + POSTGRES_EPOCH
+	if seconds < EARLIEST_SECONDS or seconds > LATEST_SECONDS:
+		return Value.Text(timestamp_text(seconds, fraction))
+
 	return Value.Timestamp(Timestamp(seconds: seconds, nanos: fraction * 1000))
 
 fn hex_digits(bytes: Bytes, from: Int, to: Int) String!:
